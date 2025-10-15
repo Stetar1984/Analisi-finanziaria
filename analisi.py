@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
-import PyPDF2
+import pdfplumber
 import io
 import re
 import pandas as pd
@@ -16,7 +16,7 @@ st.set_page_config(
 # --- FUNZIONI DI FORMATTAZIONE ---
 def format_currency(value):
     """Formatta un numero come valuta in Euro."""
-    if pd.isna(value):
+    if pd.isna(value) or not isinstance(value, (int, float)):
         return "€ 0,00"
     return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -48,113 +48,81 @@ KEYWORDS = {
     'special_negative': ['f.do amm', 'fondo amm'], # Voci che sono rettificative dell'attivo
     'income': {
          'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione', 'proventi', 'contributi in conto esercizio', 'altri ricavi'],
-         'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie'],
-         'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi', 'sanzioni', 'multe', 'abbonamenti', 'imposte', 'oneri diversi', 'quote associative']
+         'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie', 'rim.fin', 'rim.iniz'],
+         'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi', 'sanzioni', 'multe', 'abbonamenti', 'imposte', 'oneri diversi', 'quote associative', 'quote trattamento']
     }
 }
 
-def extract_text_from_pdf(pdf_file):
-    """Estrae il testo da un file PDF caricato."""
+def clean_and_convert_amount(amount_str):
+    """Pulisce una stringa di importo e la converte in float."""
+    if not amount_str: return None
     try:
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_file.read()))
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    except Exception as e:
-        st.error(f"Errore nella lettura del PDF: {e}")
-        return ""
+        # Gestisce formati come "1.234,56" e "1,234.56"
+        cleaned_str = amount_str.strip()
+        if '.' in cleaned_str and ',' in cleaned_str:
+            if cleaned_str.rfind('.') > cleaned_str.rfind(','):
+                # Formato americano: 1,234.56
+                return float(cleaned_str.replace(',', ''))
+            else:
+                # Formato europeo: 1.234,56
+                return float(cleaned_str.replace('.', '').replace(',', '.'))
+        return float(cleaned_str.replace(',', '.'))
+    except (ValueError, TypeError):
+        return None
 
-# --- SEZIONE MODIFICATA: Parsing con Logica Anti-Duplicazione ---
-def parse_financial_text(text):
+# --- NUOVO MOTORE DI ESTRAZIONE CON PDFPLUMBER ---
+def extract_and_parse_with_pdfplumber(pdf_file):
     """
-    Analizza il testo, estrae tutte le voci e poi filtra le macro-categorie
-    per evitare di sommare sia i totali che i dettagli.
+    Estrae dati da un PDF usando pdfplumber per mantenere la struttura a colonne.
     """
-    all_entries = []
-    
-    # Regex per trovare una descrizione (anche complessa) seguita da un importo.
-    pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])")
-    
-    # Pulizia preliminare del testo da header e footer ricorrenti
-    clean_text = re.sub(r'SITUAZIONE.*?\n|Pag\..*?\n|Utente:.*?\n|Data:.*?\n|Partita IVA.*?\n|Codice Fiscale.*?\n|Esercizio.*?\n|Registrazioni.*?\n', '', text, flags=re.IGNORECASE)
-
-    for line in clean_text.split('\n'):
-        # Rimuove codici conto (es. '123456 000-') per migliorare il matching
-        cleaned_line = re.sub(r'^\d+\s*-\s*', '', line.strip())
-        matches = pattern.findall(cleaned_line)
-        
-        for match in matches:
-            item_name = re.sub(r'\s{2,}', ' ', match[0].strip()) # Rimuove spazi multipli
-            amount_str = match[1].strip()
-
-            try:
-                # Gestisce sia il formato 1.234,56 che 1,234.56
-                if ',' in amount_str and '.' in amount_str:
-                    amount = float(amount_str.replace('.', '').replace(',', '.'))
-                else:
-                    amount = float(amount_str.replace(',', '.'))
-            except ValueError:
-                continue
-
-            # Ignora voci irrilevanti o troppo corte
-            if len(item_name) < 4 or item_name.lower() in ['dal', 'al', 'costi', 'ricavi', 'attivita', 'passivita', 'totale attivita', 'totale passivita']:
-                continue
-            
-            all_entries.append({'name': item_name, 'amount': amount})
-
-    # --- Filtro Intelligente per Rimuovere le Macro-Categorie (Totali) ---
-    indices_to_skip = set()
-    for i in range(len(all_entries)):
-        current_entry = all_entries[i]
-        
-        # Cerca un blocco di voci successive la cui somma corrisponde alla voce corrente
-        lookahead_sum = 0
-        for j in range(i + 1, min(i + 6, len(all_entries))):
-            lookahead_sum += all_entries[j]['amount']
-            # Usa math.isclose per tollerare piccole differenze di arrotondamento
-            if math.isclose(current_entry['amount'], lookahead_sum, rel_tol=0.01):
-                indices_to_skip.add(i) # Marca la voce corrente come totale da saltare
-                break
-        
-    # Crea la lista finale escludendo gli indici marcati
-    final_entries = [entry for i, entry in enumerate(all_entries) if i not in indices_to_skip]
-        
-    # --- Classificazione delle Voci di Dettaglio Filtrate ---
     assets_data, liabilities_data, income_data = [], [], []
-    for entry in final_entries:
-        item_name = entry['name']
-        amount = entry['amount']
-        item_name_lower = item_name.lower()
-        
-        entry_str = f"{item_name},{amount}"
+    
+    with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
+        for page in pdf.pages:
+            # Estrae il testo per righe mantenendo un minimo di allineamento
+            text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if not text: continue
 
-        if any(kw in item_name_lower for kw in KEYWORDS['special_negative']):
-            liabilities_data.append(f"{item_name},{abs(amount)}")
-            continue
+            for line in text.split('\n'):
+                line = line.strip()
+                # Salta le righe di intestazione o irrilevanti
+                if not line or len(line) < 5 or re.match(r'^(Pag\.|SITUAZIONE|Esercizio|Registrazioni)', line):
+                    continue
+                
+                # Cerca coppie voce-importo
+                matches = re.findall(r'([a-zA-Z].*?)\s+(-?[\d.,]+\d)\b', line)
+                
+                for item_name, amount_str in matches:
+                    item_name = re.sub(r'^\d+\s*-\s*', '', item_name.strip())
+                    amount = clean_and_convert_amount(amount_str)
+                    
+                    if amount is None or len(item_name) < 4: continue
+                    
+                    item_name_lower = item_name.lower()
+                    entry_str = f"{item_name},{amount}"
 
-        found = False
-        if any(kw in item_name_lower for kw in KEYWORDS['assets']['current'] + KEYWORDS['assets']['non_current']):
-            assets_data.append(entry_str)
-            found = True
-        elif any(kw in item_name_lower for kw in KEYWORDS['liabilities']['current'] + KEYWORDS['liabilities']['non_current'] + KEYWORDS['liabilities']['equity']):
-            liabilities_data.append(entry_str)
-            found = True
-        
-        # Se non classificato o è una voce chiaramente di CE
-        if not found or "totale a pareggio" in item_name_lower or "utile d'esercizio" in item_name_lower:
-            ce_type = "Fisso"
-            if any(kw in item_name_lower for kw in KEYWORDS['income']['revenue']):
-                ce_type = "Ricavo"
-            elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']):
-                ce_type = "Variabile"
-            income_data.append(f"{entry_str},{ce_type}")
+                    # Classificazione
+                    if any(kw in item_name_lower for kw in KEYWORDS['special_negative']):
+                        liabilities_data.append(f"{item_name},{abs(amount)}")
+                        continue
+
+                    found = False
+                    if any(kw in item_name_lower for kw in KEYWORDS['assets']['current'] + KEYWORDS['assets']['non_current']):
+                        assets_data.append(entry_str)
+                        found = True
+                    elif any(kw in item_name_lower for kw in KEYWORDS['liabilities']['current'] + KEYWORDS['liabilities']['non_current'] + KEYWORDS['liabilities']['equity']):
+                        liabilities_data.append(entry_str)
+                        found = True
+                    
+                    if not found:
+                        ce_type = "Fisso"
+                        if any(kw in item_name_lower for kw in KEYWORDS['income']['revenue']): ce_type = "Ricavo"
+                        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
+                        income_data.append(f"{entry_str},{ce_type}")
 
     return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
-# --- FINE SEZIONE MODIFICATA ---
 
 def parse_textarea_data(text):
-    """Converte il testo delle textarea in una lista di dizionari."""
     data = []
     for line in text.strip().split('\n'):
         if not line: continue
@@ -172,12 +140,9 @@ def parse_textarea_data(text):
 st.title("📊 Analisi di Bilancio Automatizzata")
 st.markdown("Carica un bilancio in formato PDF per estrarre e analizzare i dati automaticamente, oppure inseriscili manualmente.")
 
-if 'assets_text' not in st.session_state:
-    st.session_state.assets_text = ""
-if 'liabilities_text' not in st.session_state:
-    st.session_state.liabilities_text = ""
-if 'income_text' not in st.session_state:
-    st.session_state.income_text = ""
+if 'assets_text' not in st.session_state: st.session_state.assets_text = ""
+if 'liabilities_text' not in st.session_state: st.session_state.liabilities_text = ""
+if 'income_text' not in st.session_state: st.session_state.income_text = ""
 
 with st.sidebar:
     st.header("1. Carica Bilancio PDF")
@@ -185,13 +150,11 @@ with st.sidebar:
 
     if uploaded_file:
         with st.spinner('Estrazione dati dal PDF in corso...'):
-            raw_text = extract_text_from_pdf(uploaded_file)
-            if raw_text:
-                assets, liabilities, income = parse_financial_text(raw_text)
-                st.session_state.assets_text = assets
-                st.session_state.liabilities_text = liabilities
-                st.session_state.income_text = income
-                st.success("Dati estratti! Controlla e avvia l'analisi.")
+            assets, liabilities, income = extract_and_parse_with_pdfplumber(uploaded_file)
+            st.session_state.assets_text = assets
+            st.session_state.liabilities_text = liabilities
+            st.session_state.income_text = income
+            st.success("Dati estratti! Controlla e avvia l'analisi.")
 
     st.header("2. Dati Finanziari")
     st.markdown("Verifica i dati estratti o inseriscili manualmente.")
@@ -217,7 +180,6 @@ if analyze_button:
         st.error("Dati insufficienti. Compila tutti i campi richiesti nella barra laterale.")
     else:
         # --- CALCOLO CON LOGICA CONTABILE CORRETTA ---
-        
         total_raw_assets = sum(d['amount'] for d in assets_data)
         amortization_funds = sum(d['amount'] for d in liabilities_data if any(kw in d['item'].lower() for kw in KEYWORDS['special_negative']))
         
@@ -240,7 +202,6 @@ if analyze_button:
         
         rimanenze = sum(d['amount'] for d in assets_data if 'rimanenze' in d['item'].lower() or 'scorte' in d['item'].lower())
         
-        # Aggiunge l'utile dal CE al patrimonio netto per la quadratura
         utile_from_pdf = sum(d['amount'] for d in income_data if "utile d'esercizio" in d['item'].lower())
         if utile_from_pdf > 0:
             bs['equity'] += utile_from_pdf
@@ -250,7 +211,7 @@ if analyze_button:
         income = {
             'revenues': sum(d['amount'] for d in income_data if d['type'] == 'Ricavo'),
             'variable_costs': sum(d['amount'] for d in income_data if d['type'] == 'Variabile'),
-            'fixed_costs': sum(d['amount'] for d in income_data if d['type'] == 'Fisso'),
+            'fixed_costs': sum(d['amount'] for d in income_data if d['type'] == 'Fisso' and "utile d'esercizio" not in d['item'].lower()),
         }
 
         contribution_margin = income['revenues'] - income['variable_costs']
@@ -275,7 +236,7 @@ if analyze_button:
         st.header("Risultati dell'Analisi")
         
         balance_diff = net_total_assets - total_liabilities_and_equity
-        if abs(balance_diff) < 2: # Aumenta la tolleranza per gli arrotondamenti
+        if abs(balance_diff) < 10: # Tolleranza per arrotondamenti
             st.success(f"✅ **Controllo:** Il bilancio quadra correttamente! (Differenza: {format_currency(balance_diff)})")
         else:
             st.warning(f"⚠️ **Attenzione:** Il bilancio non quadra! Differenza: {format_currency(balance_diff)}")

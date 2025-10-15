@@ -36,8 +36,9 @@ def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
     """
     # Assicuriamoci che la colonna importo sia numerica, gestendo il formato italiano/europeo
     # Rimuove il '.' per le migliaia e sostituisce ',' con '.' per i decimali.
-    df['IMPORTO'] = df['IMPORTO'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-    df['IMPORTO'] = pd.to_numeric(df['IMPORTO'], errors='coerce').fillna(0)
+    if 'IMPORTO' in df.columns:
+        df['IMPORTO'] = df['IMPORTO'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+        df['IMPORTO'] = pd.to_numeric(df['IMPORTO'], errors='coerce').fillna(0)
 
     # Totali da Stato Patrimoniale
     totale_attivita = df[df['SEZIONE'].str.upper() == "ATTIVITA'"]['IMPORTO'].sum()
@@ -134,6 +135,13 @@ if uploaded_file is not None:
                 df = pd.read_csv(uploaded_file, sep=',')
         else:
             df = pd.read_excel(uploaded_file)
+
+        # --- FIX: Assicura che la colonna VOCE sia di tipo stringa per evitare errori ---
+        # Converte la colonna 'VOCE' in stringa, gestendo valori mancanti (NaN)
+        # che altrimenti causerebbero l'errore "'float' object has no attribute 'lower'".
+        if 'VOCE' in df.columns:
+            df['VOCE'] = df['VOCE'].astype(str).fillna('')
+
 
         # Validazione delle colonne necessarie
         required_columns = ['VOCE', 'IMPORTO', 'SEZIONE']

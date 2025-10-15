@@ -121,15 +121,21 @@ def extract_data_with_tables(pdf_file):
 
     return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-# --- NUOVA FUNZIONE PER PARSING CSV ---
+# --- FUNZIONE PER PARSING CSV AGGIORNATA ---
 def parse_csv_file(csv_file):
     """
-    Legge un file CSV e popola le aree di testo.
+    Legge un file CSV e popola le aree di testo, gestendo diverse codifiche.
     Colonne attese: Voce, Importo, Sezione, Tipo (opzionale)
     """
     assets_data, liabilities_data, income_data = [], [], []
     try:
-        df = pd.read_csv(csv_file)
+        # Tenta di leggere il file con diverse codifiche comuni
+        try:
+            df = pd.read_csv(csv_file) # Prova con utf-8 (default)
+        except UnicodeDecodeError:
+            csv_file.seek(0) # Riporta il puntatore all'inizio del file
+            df = pd.read_csv(csv_file, encoding='latin-1') # Prova con latin-1 in caso di errore
+
         # Standardizza i nomi delle colonne
         df.columns = [col.strip().lower() for col in df.columns]
         

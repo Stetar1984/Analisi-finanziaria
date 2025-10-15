@@ -1,343 +1,294 @@
 # -*- coding: utf-8 -*-
-import streamlit as st
-import pdfplumber
-import io
+"""
+Estrazione dati di bilancio da PDF 'situazione contabile' e analisi per indici/margini.
+Compatibile con PDF testuali dove le righe hanno: CODICE - DESCRIZIONE DARE AVERE SALDO [D/A].
+"""
+
 import re
+from pathlib import Path
+from typing import Optional, Dict, List
+
 import pandas as pd
-import math
 
-# --- CONFIGURAZIONE DELLA PAGINA ---
-st.set_page_config(
-    page_title="Analisi di Bilancio Automatizzata",
-    page_icon="📊",
-    layout="wide"
-)
+try:
+    import PyPDF2  # per estrazione veloce testo
+except Exception:
+    PyPDF2 = None
 
-# --- FUNZIONI DI FORMATTAZIONE ---
-def format_currency(value):
-    if pd.isna(value) or not isinstance(value, (int, float)):
-        return "€ 0,00"
-    return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+try:
+    from pdfminer.high_level import extract_text  # fallback robusto
+except Exception:
+    extract_text = None
 
-def format_decimal(value):
-    if pd.isna(value) or not isinstance(value, (int, float)):
-        return "N/A"
-    return f"{value:.2f}"
 
-def format_percent(value):
-    if pd.isna(value) or not isinstance(value, (int, float)):
-        return "N/A"
-    return f"{(value * 100):.2f}%"
+def _read_pdf_text(path: Path) -> str:
+    if PyPDF2 is not None:
+        try:
+            reader = PyPDF2.PdfReader(str(path))
+            pages = [p.extract_text() or "" for p in reader.pages]
+            txt = "\n".join(pages)
+            if len(txt.strip()) > 100:
+                return txt
+        except Exception:
+            pass
+    if extract_text is not None:
+        return extract_text(str(path)) or ""
+    raise RuntimeError("Installa almeno uno tra PyPDF2 o pdfminer.six per leggere il PDF.")
 
-# --- LOGICA DI PARSING ED ESTRAZIONE ---
 
-KEYWORDS = {
-    'assets': {
-        'current': ['cassa', 'banca', 'crediti', 'clienti', 'rimanenze', 'scorte', 'ratei attivi', 'risconti attivi', 'liquidità', 'depositi bancari', 'denaro e valori'],
-        'non_current': ['immobilizzazioni', 'impianti', 'macchinari', 'attrezzature', 'fabbricati', 'terreni', 'brevetti', 'marchi', 'software', 'partecipazioni', 'mobili e arredi', 'macchine d\'ufficio', 'auto', 'autocarri']
-    },
-    'liabilities': {
-        'current': ['debiti', 'fornitori', 'tributari', 'erario', 'inps', 'inail', 'dipendenti', 'ratei passivi', 'risconti passivi', 'banche c/c passivi'],
-        'non_current': ['mutui', 'finanziamenti', 'tfr', 'trattamento fine rapporto'],
-        'equity': ['capitale', 'riserve', 'utile', 'perdita', 'patrimonio netto']
-    },
-    'special_negative': ['f.do amm', 'fondo amm'],
-    'income': {
-         'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione', 'proventi', 'contributi in conto esercizio', 'altri ricavi'],
-         'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie', 'rim.fin', 'rim.iniz'],
-         'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi', 'sanzioni', 'multe', 'abbonamenti', 'imposte', 'oneri diversi', 'quote associative', 'quote trattamento']
-    }
-}
+def _normalize_space(s: str) -> str:
+    import re
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n", s)
+    return s
 
-def clean_and_convert_amount(amount_str):
-    if not amount_str: return None
+
+def _itonum(token: str) -> Optional[float]:
+    import re
+    t = token.strip()
+    if not t:
+        return None
+    t = re.sub(r"[_]+", "", t)
+    t = re.sub(r"[^\d\.\,\-]", "", t)
+    if t == "":
+        return None
+    t = t.replace(".", "").replace(",", ".")
     try:
-        cleaned_str = str(amount_str).strip().replace('.', '').replace(',', '.')
-        return float(cleaned_str)
-    except (ValueError, TypeError):
+        return float(t)
+    except Exception:
         return None
 
-# --- MOTORE DI ESTRAZIONE PDF CHE RICONOSCE IL GRASSETTO ---
-def extract_data_with_formatting(pdf_file):
-    all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
-    with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
-        is_ce_section = False
-        for page in pdf.pages:
-            page_text_for_section_check = page.extract_text()
-            if page_text_for_section_check and "CONTO ECONOMICO" in page_text_for_section_check:
-                is_ce_section = True
-            mid_point = page.width / 2
-            left_bbox, right_bbox = (0, 0, mid_point, page.height), (mid_point, 0, page.width, page.height)
-            def process_column(column_bbox, target_list):
-                words = page.crop(column_bbox).extract_words(x_tolerance=2, y_tolerance=2)
-                if not words: return
-                lines = {}
-                for word in words:
-                    top = round(word['top'])
-                    if top not in lines: lines[top] = []
-                    lines[top].append(word)
-                for top in sorted(lines.keys()):
-                    line_words = sorted(lines[top], key=lambda w: w['x0'])
-                    line_text = " ".join(w['text'] for w in line_words)
-                    is_bold = any("Bold" in w.get('fontname', '') for w in line_words)
-                    pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$")
-                    match = pattern.search(line_text)
-                    if match:
-                        item_name = re.sub(r'^\d+\s*[-\s]*', '', match.group(1).strip())
-                        amount = clean_and_convert_amount(match.group(2))
-                        if amount is not None and len(item_name) > 3 and not item_name.lower().startswith('totale') and not is_bold:
-                            target_list.append({'name': item_name, 'amount': amount})
-            if is_ce_section:
-                process_column(left_bbox, all_costs)
-                process_column(right_bbox, all_revenues)
-            else:
-                process_column(left_bbox, all_assets)
-                process_column(right_bbox, all_liabilities)
-    income_details = all_costs + all_revenues
-    final_assets, final_liabilities, final_income = [], [], []
-    for entry in all_assets: final_assets.append(f"{entry['name']},{entry['amount']}")
-    for entry in all_liabilities: final_liabilities.append(f"{entry['name']},{entry['amount']}")
-    for entry in income_details:
-        item_name_lower = entry['name'].lower()
-        ce_type = "Fisso"
-        is_revenue = any(kw in item_name_lower for kw in KEYWORDS['income']['revenue'])
-        if is_revenue or entry in all_revenues: ce_type = "Ricavo"
-        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
-        final_income.append(f"{entry['name']},{entry['amount']},{ce_type}")
-    return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-# --- FUNZIONE PER PARSING CSV OTTIMIZZATA ---
-def parse_csv_file(csv_file):
-    assets_data, liabilities_data, income_data = [], [], []
-    csv_content = csv_file.read()
-    df = None
-    
-    # Lista di configurazioni da provare
-    configs = [
-        {'encoding': 'utf-8', 'sep': None}, # Auto-detect separator for utf-8
-        {'encoding': 'latin-1', 'sep': None} # Auto-detect separator for latin-1
-    ]
-
-    for config in configs:
-        try:
-            # Usa il motore python che è più flessibile e l'opzione on_bad_lines per saltare le righe errate
-            df = pd.read_csv(io.BytesIO(csv_content), 
-                           encoding=config['encoding'], 
-                           sep=config['sep'], 
-                           engine='python',
-                           on_bad_lines='skip')
-            
-            # Controlla se le colonne necessarie sono state trovate
-            if 'voce' in [c.lower().strip() for c in df.columns]:
-                break # Successo, esce dal ciclo
-            else:
-                df = None # Resetta df se le colonne non sono corrette
-        except Exception:
-            # Resetta il puntatore del file per il prossimo tentativo
-            csv_file.seek(0) 
-            csv_content = csv_file.read()
-            continue # Prova la configurazione successiva
-
-    if df is None:
-        st.error("Errore critico: Impossibile analizzare il file CSV.")
-        st.info("Consiglio: Assicurati che il file sia un CSV valido con separatore virgola (,) o punto e virgola (;) e che la prima riga contenga i titoli di colonna corretti (voce, importo, sezione, tipo).")
-        return "", "", ""
-
-    df.columns = [col.strip().lower() for col in df.columns]
-    
-    required_cols = ['voce', 'importo', 'sezione']
-    if not all(col in df.columns for col in required_cols):
-        found_cols = ', '.join(df.columns)
-        st.error(f"Errore nelle colonne del CSV.")
-        st.error(f"**Colonne richieste:** {', '.join(required_cols)}")
-        st.error(f"**Colonne trovate nel tuo file:** {found_cols}")
-        st.info("Assicurati che la prima riga del tuo file CSV contenga esattamente quei nomi di colonna.")
-        return "", "", ""
-        
-    for _, row in df.iterrows():
-        voce = row['voce']
-        importo = row['importo']
-        sezione = row['sezione'].lower()
-        
-        if 'attivit' in sezione:
-            assets_data.append(f"{voce},{importo}")
-        elif 'passivit' in sezione or 'pn' in sezione:
-             liabilities_data.append(f"{voce},{importo}")
-        elif 'conto economico' in sezione:
-            tipo = row.get('tipo', 'Fisso')
-            income_data.append(f"{voce},{importo},{tipo}")
-
-    return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
+LINE_RE = re.compile(
+    r"(?P<code>\d{5,6}\s*\d{0,3})\s*-\s*(?P<descr>.+?)\s+"
+    r"(?P<dare>\d{1,3}(?:\.\d{3})*(?:,\d{2})?|0,00|0,0|0)\s+"
+    r"(?P<avere>\d{1,3}(?:\.\d{3})*(?:,\d{2})?|0,00|0,0|0)\s+"
+    r"(?P<saldo>\d{1,3}(?:\.\d{3})*(?:,\d{2})?|0,00|0,0|0)"
+    r"(?:\s+(?P<segn>[^ \n\r]+))?",
+    re.IGNORECASE,
+)
 
 
-def parse_textarea_data(text):
-    data = []
-    for line in text.strip().split('\n'):
-        if not line: continue
-        parts = line.split(',')
-        try:
-            item = parts[0].strip()
-            amount = float(parts[1].strip())
-            ce_type = parts[2].strip().capitalize() if len(parts) > 2 else None
-            data.append({'item': item, 'amount': amount, 'type': ce_type})
-        except (ValueError, IndexError):
-            pass
-    return data
+def _classify_row(descr: str, code: str) -> str:
+    s = descr.lower()
+    if "ricavi delle vendite" in s or "altri ricavi" in s or "contributi in conto esercizio" in s:
+        return "CE_RICAVI"
+    if s.startswith("costi "):
+        return "CE_COSTI"
+    if any(k in s for k in ["costi per servizi", "godimento beni di terzi", "personale", "ammortamenti", "oneri"]):
+        return "CE_COSTI"
+    if any(k in s for k in ["crediti", "depositi bancari", "cassa", "rimanenze", "ratei e risconti attivi"]):
+        return "SP_ATTIVITA"
+    if any(k in s for k in ["capitale", "riserva", "tfr", "debiti", "ratei e risconti passivi"]):
+        return "SP_PASSIVITA"
+    if code.startswith(("1", "15", "17")):
+        return "SP_ATTIVITA"
+    if code.startswith(("3", "37", "39")):
+        return "SP_PASSIVITA"
+    if code.startswith("7"):
+        return "CONTO_ECONOMICO"
+    return "ALTRO"
 
-# --- INTERFACCIA UTENTE (UI) ---
-st.title("📊 Analisi di Bilancio Automatizzata")
-st.markdown("Carica un bilancio in formato **CSV (consigliato)** o PDF, oppure inserisci i dati manualmente.")
 
-if 'assets_text' not in st.session_state: st.session_state.assets_text = ""
-if 'liabilities_text' not in st.session_state: st.session_state.liabilities_text = ""
-if 'income_text' not in st.session_state: st.session_state.income_text = ""
+def parse_pdf_to_df(pdf_path: str) -> pd.DataFrame:
+    txt = _read_pdf_text(Path(pdf_path))
+    text = _normalize_space(txt)
 
-with st.sidebar:
-    st.header("1. Carica il Bilancio")
-    uploaded_file = st.file_uploader("Seleziona un file CSV o PDF", type=["csv", "pdf"])
+    rows: List[Dict] = []
+    for m in LINE_RE.finditer(text):
+        d = m.groupdict()
+        code = re.sub(r"\s+", "", d["code"])
+        descr = d["descr"].strip()
+        dare = _itonum(d["dare"])
+        avere = _itonum(d["avere"])
+        saldo = _itonum(d["saldo"])
+        segno = (d.get("segn") or "").strip().upper()
+        if segno not in {"D", "A"}:
+            segno = "D" if (dare or 0) >= (avere or 0) else "A"
+        rows.append(
+            {"codice": code, "descrizione": descr, "dare": dare, "avere": avere, "saldo": saldo, "segno": segno}
+        )
 
-    with st.expander("❓ **Formato CSV Richiesto (IMPORTANTE)**"):
-        st.info("""
-        Per un'analisi precisa, usa un file CSV con queste colonne:
-        - **voce**: La descrizione della voce di bilancio.
-        - **importo**: L'importo numerico (es. `1234.56`).
-        - **sezione**: `Attività`, `Passività`, `PN`, `Conto Economico`.
-        - **tipo** (Opzionale, solo per CE): `Ricavo`, `Variabile`, `Fisso`.
-        """)
+    df = pd.DataFrame(rows).drop_duplicates()
+    if df.empty:
+        raise ValueError("Nessuna riga riconosciuta. Verifica il layout del PDF.")
+    df["sezione"] = df.apply(lambda r: _classify_row(r["descrizione"], r["codice"]), axis=1)
+    return df
 
-    if uploaded_file:
-        with st.spinner('Estrazione dati dal file...'):
-            file_type = uploaded_file.name.split('.')[-1].lower()
-            if file_type == 'pdf':
-                assets, liabilities, income = extract_data_with_formatting(uploaded_file)
-            elif file_type == 'csv':
-                assets, liabilities, income = parse_csv_file(uploaded_file)
-            else:
-                assets, liabilities, income = "", "", ""
-                st.error("Formato file non supportato.")
-            st.session_state.assets_text = assets
-            st.session_state.liabilities_text = liabilities
-            st.session_state.income_text = income
-            if assets or liabilities or income:
-                st.success("Dati estratti! Controlla e avvia l'analisi.")
 
-    st.header("2. Dati Finanziari")
-    st.markdown("Verifica i dati estratti o inseriscili manualmente.")
-    st.text_area("ATTIVITÀ (Voce,Importo)", key="assets_text", height=150)
-    st.text_area("PASSIVITÀ E PN (Voce,Importo)", key="liabilities_text", height=150)
-    st.text_area("CONTO ECONOMICO (Voce,Importo,Tipo*)", key="income_text", height=150, help="*Tipi: Ricavo, Variabile, Fisso")
-
-    st.header("3. Impostazioni")
-    tax_rate = st.number_input("Aliquota Fiscale (%)", value=24.0, min_value=0.0, max_value=100.0, step=0.5) / 100
-
-    analyze_button = st.button("🚀 Elabora Analisi", use_container_width=True)
-
-if not analyze_button:
-    st.info("Carica un file o inserisci i dati nella barra laterale e clicca 'Elabora Analisi' per visualizzare i risultati.")
-
-if analyze_button:
-    assets_data = parse_textarea_data(st.session_state.assets_text)
-    liabilities_data = parse_textarea_data(st.session_state.liabilities_text)
-    income_data = parse_textarea_data(st.session_state.income_text)
-
-    if not assets_data or not liabilities_data or not income_data:
-        st.error("Dati insufficienti. Compila tutti i campi richiesti nella barra laterale.")
-    else:
-        # --- CALCOLO CON LOGICA CONTABILE CORRETTA ---
-        total_raw_assets = sum(d['amount'] for d in assets_data)
-        amortization_funds = sum(d['amount'] for d in liabilities_data if any(kw in d['item'].lower() for kw in KEYWORDS['special_negative']))
-        net_total_assets = total_raw_assets - amortization_funds
-        current_assets_raw = sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['current']))
-        non_current_assets_raw = sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['non_current']))
-        net_non_current_assets = non_current_assets_raw - amortization_funds
-        liabilities_no_funds = [d for d in liabilities_data if not any(kw in d['item'].lower() for kw in KEYWORDS['special_negative'])]
-        bs = {
-            'current_assets': current_assets_raw,
-            'non_current_assets': net_non_current_assets,
-            'current_liabilities': sum(d['amount'] for d in liabilities_no_funds if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['current'])),
-            'non_current_liabilities': sum(d['amount'] for d in liabilities_no_funds if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['non_current'])),
-            'equity': sum(d['amount'] for d in liabilities_no_funds if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['equity'])),
-        }
-        rimanenze = sum(d['amount'] for d in assets_data if 'rimanenze' in d['item'].lower() or 'scorte' in d['item'].lower())
-        utile_from_pdf = sum(d['amount'] for d in income_data if "utile d'esercizio" in d['item'].lower() or "utile" == d['item'].lower())
-        if utile_from_pdf > 0:
-            bs['equity'] += utile_from_pdf
-        total_liabilities_and_equity = bs['current_liabilities'] + bs['non_current_liabilities'] + bs['equity']
-        income = {
-            'revenues': sum(d['amount'] for d in income_data if d['type'] == 'Ricavo'),
-            'variable_costs': sum(d['amount'] for d in income_data if d['type'] == 'Variabile'),
-            'fixed_costs': sum(d['amount'] for d in income_data if d['type'] == 'Fisso' and "utile" not in d['item'].lower()),
-        }
-        contribution_margin = income['revenues'] - income['variable_costs']
-        ebit = contribution_margin - income['fixed_costs']
-        interest = sum(d['amount'] for d in income_data if 'interessi' in d['item'].lower() or 'oneri finanziari' in d['item'].lower())
-        ebt = ebit - interest
-        taxes = ebt * tax_rate if ebt > 0 else 0
-        net_income = ebt - interest
-        ratios = {
-            'current_ratio': bs['current_assets'] / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
-            'quick_ratio': (bs['current_assets'] - rimanenze) / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
-            'debt_to_equity': (bs['current_liabilities'] + bs['non_current_liabilities']) / bs['equity'] if bs['equity'] > 0 else 0,
-            'ros': ebit / income['revenues'] if income['revenues'] > 0 else 0,
-            'roe': net_income / bs['equity'] if bs['equity'] > 0 else 0,
-            'roi': ebit / net_total_assets if net_total_assets > 0 else 0,
-            'contribution_margin_ratio': contribution_margin / income['revenues'] if income['revenues'] > 0 else 0,
-            'break_even_point': income['fixed_costs'] / (contribution_margin / income['revenues']) if contribution_margin > 0 else 0
-        }
-        # --- VISUALIZZAZIONE ---
-        st.header("Risultati dell'Analisi")
-        balance_diff = net_total_assets - total_liabilities_and_equity
-        if abs(balance_diff) < 20:
-            st.success(f"✅ **Controllo:** Il bilancio quadra correttamente! (Differenza: {format_currency(balance_diff)})")
+def _sum_saldo(dfsec: pd.DataFrame, prefer_credit: str) -> float:
+    vals = []
+    for _, r in dfsec.iterrows():
+        v = r["saldo"] or 0.0
+        if r["segno"] == "A" and prefer_credit == "A":
+            vals.append(v)
+        elif r["segno"] == "D" and prefer_credit == "D":
+            vals.append(v)
         else:
-            st.warning(f"⚠️ **Attenzione:** Il bilancio non quadra! Differenza: {format_currency(balance_diff)}")
-        tab1, tab2, tab3 = st.tabs(["📈 Dashboard Indici", "📑 Stato Patrimoniale", "💰 Conto Economico"])
-        with tab1:
-            st.subheader("Dashboard Indici Principali")
-            cols = st.columns(3)
-            with cols[0]:
-                st.metric("ROE (Redditività Capitale Proprio)", format_percent(ratios['roe']))
-                st.metric("ROI (Redditività Capitale Investito)", format_percent(ratios['roi']))
-                st.metric("ROS (Redditività delle Vendite)", format_percent(ratios['ros']))
-            with cols[1]:
-                st.metric("Indice di Liquidità (Current Ratio)", format_decimal(ratios['current_ratio']))
-                st.metric("Indice di Tesoreria (Quick Ratio)", format_decimal(ratios['quick_ratio']))
-                st.metric("Rapporto di Indebitamento (D/E)", format_decimal(ratios['debt_to_equity']))
-            with cols[2]:
-                st.metric("Margine di Contribuzione %", format_percent(ratios['contribution_margin_ratio']))
-                st.metric("Punto di Pareggio (Fatturato)", format_currency(ratios['break_even_point']))
-        with tab2:
-            st.subheader("Stato Patrimoniale Riclassificato (Criterio Finanziario)")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("#### Attività")
-                sp_assets_df = pd.DataFrame([
-                    {"Voce": "Attivo Corrente", "Importo": bs['current_assets']},
-                    {"Voce": "Attivo Non Corrente (al netto dei fondi)", "Importo": bs['non_current_assets']},
-                    {"Voce": "**TOTALE ATTIVITÀ**", "Importo": net_total_assets}
-                ])
-                st.dataframe(sp_assets_df.style.format({"Importo": format_currency}), use_container_width=True)
-            with col2:
-                st.markdown("#### Passività e Patrimonio Netto")
-                sp_liab_df = pd.DataFrame([
-                    {"Voce": "Passivo Corrente", "Importo": bs['current_liabilities']},
-                    {"Voce": "Passivo Non Corrente (Consolidato)", "Importo": bs['non_current_liabilities']},
-                    {"Voce": "**Patrimonio Netto**", "Importo": bs['equity']},
-                    {"Voce": "**TOTALE PASSIVITÀ E PN**", "Importo": total_liabilities_and_equity}
-                ])
-                st.dataframe(sp_liab_df.style.format({"Importo": format_currency}), use_container_width=True)
-        with tab3:
-            st.subheader("Conto Economico Riclassificato (A Margine di Contribuzione)")
-            ce_df = pd.DataFrame([
-                {"Voce": "Ricavi delle Vendite e Prestazioni", "Importo": income['revenues']},
-                {"Voce": "(-) Costi Variabili", "Importo": -income['variable_costs']},
-                {"Voce": "**(=) Margine di Contribuzione**", "Importo": contribution_margin},
-                {"Voce": "(-) Costi Fissi", "Importo": -income['fixed_costs']},
-                {"Voce": "**(=) Risultato Operativo (EBIT)**", "Importo": ebit},
-                {"Voce": "(-) Oneri Finanziari", "Importo": -interest},
-                {"Voce": "(=) Risultato Ante Imposte (EBT)", "Importo": ebt},
-                {"Voce": "(-) Imposte", "Importo": -taxes},
-                {"Voce": "**(=) UTILE/PERDITA NETTO**", "Importo": net_income}
-            ])
-            st.dataframe(ce_df.style.format({"Importo": format_currency}), use_container_width=True)
+            vals.append(-v)
+    return float(sum(vals))
 
+
+def _is_current_asset(descr: str) -> bool:
+    s = descr.lower()
+    return any(k in s for k in [
+        "crediti v/clienti", "crediti tributari", "crediti v/altri",
+        "depositi bancari", "cassa", "rimanenze", "ratei e risconti attivi"
+    ])
+
+
+def _is_current_liability(descr: str) -> bool:
+    s = descr.lower()
+    return any(k in s for k in [
+        "debiti verso fornitori", "debiti tributari", "debiti v/istit.",
+        "altri debiti", "ratei e risconti passivi"
+    ])
+
+
+def compute_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    attivita = _sum_saldo(df[df["sezione"] == "SP_ATTIVITA"], prefer_credit="D")
+    passivita = _sum_saldo(df[df["sezione"] == "SP_PASSIVITA"], prefer_credit="A")
+
+    attivo_corrente = sum(
+        (r["saldo"] or 0.0) * (1 if r["segno"] == "D" else -1)
+        for _, r in df[df["sezione"] == "SP_ATTIVITA"].iterrows()
+        if _is_current_asset(r["descrizione"])
+    )
+
+    passivo_corrente = sum(
+        (r["saldo"] or 0.0) * (1 if r["segno"] == "A" else -1)
+        for _, r in df[df["sezione"] == "SP_PASSIVITA"].iterrows()
+        if _is_current_liability(r["descrizione"])
+    )
+
+    liq_immediate = df[
+        (df["sezione"] == "SP_ATTIVITA")
+        & df["descrizione"].str.lower().str.contains("depositi bancari|cassa contanti|carta credito|denaro e valori", regex=True)
+    ]
+    liquidita = sum((r["saldo"] or 0.0) * (1 if r["segno"] == "D" else -1) for _, r in liq_immediate.iterrows())
+
+    rimanenze = df[
+        (df["sezione"] == "SP_ATTIVITA")
+        & df["descrizione"].str.lower().str.contains("rimanenze|rim. mat", regex=True)
+    ]
+    rimanenze_val = sum((r["saldo"] or 0.0) * (1 if r["segno"] == "D" else -1) for _, r in rimanenze.iterrows())
+
+    ricavi = sum(
+        (r["saldo"] or 0.0) * (1 if r["segno"] == "A" else -1)
+        for _, r in df[df["descrizione"].str.lower().str.contains("ricavi delle vendite|altri ricavi|contributi in conto esercizio")].iterrows()
+    )
+
+    def sum_block(mask_regex: str) -> float:
+        block = df[df["descrizione"].str.lower().str.contains(mask_regex, regex=True)]
+        return float(sum((r["saldo"] or 0.0) * (1 if r["segno"] == "D" else -1) for _, r in block.iterrows()))
+
+    val_materie = sum_block("costi mat\\.prime|acquisto di materie prime")
+    val_servizi = sum_block("costi per servizi")
+    val_godimento = sum_block("costi per godimento beni di terzi")
+    val_altri = sum_block("indumenti di lavoro|utenze|assicurazioni|gestione autocarri|elaborazione dati|consulenza")
+
+    ebitda_approx = ricavi - (val_materie + val_servizi + val_godimento + val_altri)
+    current = (attivo_corrente / passivo_corrente) if passivo_corrente else None
+    quick = ((attivo_corrente - rimanenze_val) / passivo_corrente) if passivo_corrente else None
+    ccn = attivo_corrente - passivo_corrente
+    margine_tesoreria = (attivo_corrente - rimanenze_val) - passivo_corrente
+    margine_struttura = (attivita - attivo_corrente) - (passivita - passivo_corrente)
+    ebitda_margin = (ebitda_approx / ricavi) if ricavi else None
+
+    summary = {
+        "Attività (stima)": attivita,
+        "Passività (stima)": passivita,
+        "Attivo corrente (stima)": attivo_corrente,
+        "Passivo corrente (stima)": passivo_corrente,
+        "Liquidità immediate (stima)": liquidita,
+        "Rimanenze (stima)": rimanenze_val,
+        "CCN": ccn,
+        "Current ratio": current,
+        "Quick ratio": quick,
+        "Margine di tesoreria": margine_tesoreria,
+        "Margine di struttura (eur.)": margine_struttura,
+        "Ricavi (stima)": ricavi,
+        "Costi materie": val_materie,
+        "Costi servizi": val_servizi,
+        "Costi godimento beni terzi": val_godimento,
+        "Altri costi caratteristici (euristico)": val_altri,
+        "EBITDA stimato": ebitda_approx,
+        "EBITDA margin": ebitda_margin,
+    }
+    return pd.DataFrame([summary])
+
+
+def analyze_pdf(pdf_path: str, out_csv: Optional[str] = None, out_xlsx: Optional[str] = None):
+    df = parse_pdf_to_df(pdf_path)
+    kpis = compute_kpis(df)
+    if out_csv:
+        df.to_csv(out_csv, index=False, encoding="utf-8")
+    if out_xlsx:
+        with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as xw:
+            df.to_excel(xw, sheet_name="righe_estratte", index=False)
+            kpis.to_excel(xw, sheet_name="indici_margini", index=False)
+    return df, kpis
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="Estrai righe contabili e KPI da un PDF.")
+    p.add_argument("pdf", help="Percorso PDF.")
+    p.add_argument("--csv", help="Salva righe estratte in CSV.")
+    p.add_argument("--xlsx", help="Salva analisi in Excel.")
+    args = p.parse_args()
+
+    df, kpis = analyze_pdf(args.pdf, args.csv, args.xlsx)
+    print("\n== RIGHE ESTRATTE ==")
+    print(df.head(20).to_string(index=False))
+    print("\n== INDICI E MARGINI ==")
+    print(kpis.to_string(index=False))
+app_streamlit.py
+python
+Copia codice
+# -*- coding: utf-8 -*-
+import streamlit as st
+import pandas as pd
+from io import BytesIO
+from bilancio_extractor import parse_pdf_to_df, compute_kpis
+
+st.set_page_config(page_title="Analisi Bilancio da PDF", layout="wide")
+
+st.title("Analisi di bilancio da PDF")
+st.caption("Carica un PDF 'situazione contabile'. Il parser usa euristiche su descrizioni e colonne DARE/AVERE/SALDO.")
+
+uploaded = st.file_uploader("Seleziona PDF", type=["pdf"])
+
+if uploaded is not None:
+    tmp = f"/tmp/_bil_{uploaded.name}"
+    with open(tmp, "wb") as f:
+        f.write(uploaded.read())
+
+    try:
+        df = parse_pdf_to_df(tmp)
+        kpis = compute_kpis(df)
+
+        st.subheader("Righe estratte")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.subheader("Indici e margini")
+        st.dataframe(kpis, use_container_width=True, hide_index=True)
+
+        # Download CSV
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Scarica CSV righe", data=csv_bytes, file_name="righe_estratte.csv", mime="text/csv")
+
+        # Download Excel
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as xw:
+            df.to_excel(xw, sheet_name="righe_estratte", index=False)
+            kpis.to_excel(xw, sheet_name="indici_margini", index=False)
+        st.download_button("Scarica Excel analisi", data=output.getvalue(),
+                           file_name="analisi_bilancio.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.error(f"Errore parsing: {e}")
+        st.info("Controlla che il PDF sia testuale e che le colonne DARE/AVERE/SALDO siano allineate.")
+else:
+    st.info("Carica un PDF per iniziare.")

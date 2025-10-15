@@ -152,22 +152,35 @@ def parse_csv_file(csv_file):
     """
     assets_data, liabilities_data, income_data = [], [], []
     
-    # Il file dall'uploader è un oggetto BytesIO. Dobbiamo leggerlo in memoria.
     csv_content = csv_file.read()
+    df = None
     
-    try:
-        # Tenta di leggere con la codifica utf-8 e il motore Python più robusto
-        df = pd.read_csv(io.BytesIO(csv_content), sep=None, engine='python')
-    except (UnicodeDecodeError, pd.errors.ParserError):
-        try:
-            # Se utf-8 fallisce, prova con latin-1, comune per file da Windows/Excel
-            df = pd.read_csv(io.BytesIO(csv_content), encoding='latin-1', sep=None, engine='python')
-        except Exception as e:
-            st.error(f"Errore critico nella lettura del file CSV: {e}")
-            st.info("Consiglio: Prova a salvare il file CSV da Excel scegliendo il formato 'CSV UTF-8 (delimitato da virgole)'.")
-            return "", "", ""
+    configs = [
+        {'encoding': 'utf-8', 'sep': ','},
+        {'encoding': 'utf-8', 'sep': ';'},
+        {'encoding': 'latin-1', 'sep': ','},
+        {'encoding': 'latin-1', 'sep': ';'}
+    ]
 
-    # Standardizza i nomi delle colonne
+    for config in configs:
+        try:
+            df = pd.read_csv(io.BytesIO(csv_content), encoding=config['encoding'], sep=config['sep'], engine='python')
+            # Se la lettura ha successo e le colonne sembrano corrette, esce dal ciclo
+            if 'voce' in [c.lower().strip() for c in df.columns]:
+                break
+            else:
+                df = None
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            # Riposiziona il puntatore per la prossima lettura
+            csv_file.seek(0)
+            csv_content = csv_file.read()
+            continue
+
+    if df is None:
+        st.error("Errore critico: Impossibile analizzare il file CSV.")
+        st.info("Consiglio: Assicurati che il file sia un CSV valido con separatore virgola (,) o punto e virgola (;). Prova a salvarlo da Excel scegliendo il formato 'CSV UTF-8 (delimitato da virgole)'.")
+        return "", "", ""
+
     df.columns = [col.strip().lower() for col in df.columns]
     
     required_cols = ['voce', 'importo', 'sezione']
@@ -185,10 +198,11 @@ def parse_csv_file(csv_file):
         elif 'passivit' in sezione or 'pn' in sezione:
              liabilities_data.append(f"{voce},{importo}")
         elif 'conto economico' in sezione:
-            tipo = row.get('tipo', 'Fisso') # Default a Fisso se la colonna Tipo manca
+            tipo = row.get('tipo', 'Fisso')
             income_data.append(f"{voce},{importo},{tipo}")
 
     return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
+
 
 def parse_textarea_data(text):
     data = []

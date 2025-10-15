@@ -65,12 +65,8 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- NUOVO MOTORE DI ESTRAZIONE BASATO SU CROPPING DELLE COLONNE ---
+# --- MOTORE DI ESTRAZIONE PDF BASATO SU CROPPING DELLE COLONNE ---
 def extract_data_with_cropping(pdf_file):
-    """
-    Estrae dati da un PDF usando il cropping delle colonne con pdfplumber.
-    Questo metodo è molto più robusto per i layout a 2 colonne.
-    """
     all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
 
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
@@ -149,33 +145,50 @@ def extract_data_with_cropping(pdf_file):
 
     return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-# --- FUNZIONE PER PARSING CSV ---
+# --- FUNZIONE PER PARSING CSV AGGIORNATA ---
 def parse_csv_file(csv_file):
+    """
+    Legge un file CSV e popola le aree di testo, gestendo diverse codifiche ed errori di parsing.
+    """
     assets_data, liabilities_data, income_data = [], [], []
+    
+    # Il file dall'uploader è un oggetto BytesIO. Dobbiamo leggerlo in memoria.
+    csv_content = csv_file.read()
+    
     try:
+        # Tenta di leggere con la codifica utf-8 e il motore Python più robusto
+        df = pd.read_csv(io.BytesIO(csv_content), sep=None, engine='python')
+    except (UnicodeDecodeError, pd.errors.ParserError):
         try:
-            df = pd.read_csv(csv_file)
-        except UnicodeDecodeError:
-            csv_file.seek(0)
-            df = pd.read_csv(csv_file, encoding='latin-1')
-        
-        df.columns = [col.strip().lower() for col in df.columns]
-        required_cols = ['voce', 'importo', 'sezione']
-        if not all(col in df.columns for col in required_cols):
-            st.error(f"Il file CSV deve contenere le colonne: {', '.join(required_cols)}")
+            # Se utf-8 fallisce, prova con latin-1, comune per file da Windows/Excel
+            df = pd.read_csv(io.BytesIO(csv_content), encoding='latin-1', sep=None, engine='python')
+        except Exception as e:
+            st.error(f"Errore critico nella lettura del file CSV: {e}")
+            st.info("Consiglio: Prova a salvare il file CSV da Excel scegliendo il formato 'CSV UTF-8 (delimitato da virgole)'.")
             return "", "", ""
-            
-        for _, row in df.iterrows():
-            voce, importo, sezione = row['voce'], row['importo'], row['sezione'].lower()
-            if 'attivit' in sezione: assets_data.append(f"{voce},{importo}")
-            elif 'passivit' in sezione or 'pn' in sezione: liabilities_data.append(f"{voce},{importo}")
-            elif 'conto economico' in sezione:
-                tipo = row.get('tipo', 'Fisso')
-                income_data.append(f"{voce},{importo},{tipo}")
-        return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
-    except Exception as e:
-        st.error(f"Errore nella lettura del file CSV: {e}")
+
+    # Standardizza i nomi delle colonne
+    df.columns = [col.strip().lower() for col in df.columns]
+    
+    required_cols = ['voce', 'importo', 'sezione']
+    if not all(col in df.columns for col in required_cols):
+        st.error(f"Il file CSV deve contenere le colonne: {', '.join(required_cols)}")
         return "", "", ""
+        
+    for _, row in df.iterrows():
+        voce = row['voce']
+        importo = row['importo']
+        sezione = row['sezione'].lower()
+        
+        if 'attivit' in sezione:
+            assets_data.append(f"{voce},{importo}")
+        elif 'passivit' in sezione or 'pn' in sezione:
+             liabilities_data.append(f"{voce},{importo}")
+        elif 'conto economico' in sezione:
+            tipo = row.get('tipo', 'Fisso') # Default a Fisso se la colonna Tipo manca
+            income_data.append(f"{voce},{importo},{tipo}")
+
+    return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
 
 def parse_textarea_data(text):
     data = []
@@ -291,7 +304,7 @@ if analyze_button:
         interest = sum(d['amount'] for d in income_data if 'interessi' in d['item'].lower() or 'oneri finanziari' in d['item'].lower())
         ebt = ebit - interest
         taxes = ebt * tax_rate if ebt > 0 else 0
-        net_income = ebt - taxes
+        net_income = ebt - interest
 
         ratios = {
             'current_ratio': bs['current_assets'] / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,

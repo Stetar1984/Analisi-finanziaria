@@ -65,100 +65,114 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- MOTORE DI ESTRAZIONE PDF BASATO SU TABELLE ---
-def extract_data_with_tables(pdf_file):
-    assets_data, liabilities_data, income_data = [], [], []
+# --- NUOVO MOTORE DI ESTRAZIONE BASATO SU CROPPING DELLE COLONNE ---
+def extract_data_with_cropping(pdf_file):
+    """
+    Estrae dati da un PDF usando il cropping delle colonne con pdfplumber.
+    Questo metodo è molto più robusto per i layout a 2 colonne.
+    """
+    all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
+
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
         is_ce_section = False
         for page in pdf.pages:
             full_text = page.extract_text()
             if "CONTO ECONOMICO" in full_text:
                 is_ce_section = True
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if is_ce_section:
-                        if len(row) < 4: continue
-                        cost_desc, cost_amount_str, rev_desc, rev_amount_str = row[0], row[1], row[2], row[3]
-                        if cost_desc and cost_amount_str:
-                            cost_amount = clean_and_convert_amount(cost_amount_str)
-                            if cost_amount: income_data.append({'name': cost_desc.replace('\n', ' '), 'amount': cost_amount})
-                        if rev_desc and rev_amount_str:
-                            rev_amount = clean_and_convert_amount(rev_amount_str)
-                            if rev_amount: income_data.append({'name': rev_desc.replace('\n', ' '), 'amount': rev_amount})
-                    else:
-                        if len(row) < 4: continue
-                        asset_desc, asset_amount_str, liab_desc, liab_amount_str = row[0], row[1], row[2], row[3]
-                        if asset_desc and asset_amount_str:
-                            asset_amount = clean_and_convert_amount(asset_amount_str)
-                            if asset_amount: assets_data.append({'name': asset_desc.replace('\n', ' '), 'amount': asset_amount})
-                        if liab_desc and liab_amount_str:
-                            liab_amount = clean_and_convert_amount(liab_amount_str)
-                            if liab_amount: liabilities_data.append({'name': liab_desc.replace('\n', ' '), 'amount': liab_amount})
-    
+
+            mid_point = page.width / 2
+            left_bbox = (0, 0, mid_point, page.height)
+            right_bbox = (mid_point, 0, page.width, page.height)
+
+            left_text = page.crop(left_bbox).extract_text(x_tolerance=2)
+            right_text = page.crop(right_bbox).extract_text(x_tolerance=2)
+
+            def process_column(text, target_list):
+                pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$", re.MULTILINE)
+                if not text: return
+                
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if len(line) < 5 or line.lower().startswith(('totale', 'attivita', 'passivita', 'costi', 'ricavi')):
+                        continue
+                    
+                    cleaned_line = re.sub(r'^\d+\s*[-\s]*', '', line)
+                    
+                    match = pattern.search(cleaned_line)
+                    if match:
+                        item_name = match.group(1).strip()
+                        amount = clean_and_convert_amount(match.group(2))
+                        if amount is not None and len(item_name) > 3:
+                            target_list.append({'name': item_name, 'amount': amount})
+
+            if is_ce_section:
+                process_column(left_text, all_costs)
+                process_column(right_text, all_revenues)
+            else:
+                process_column(left_text, all_assets)
+                process_column(right_text, all_liabilities)
+
     def filter_totals(entries):
         indices_to_skip = set()
         for i in range(len(entries)):
+            if i in indices_to_skip: continue
             lookahead_sum = 0
-            for j in range(i + 1, min(i + 6, len(entries))):
+            sub_items_count = 0
+            for j in range(i + 1, min(i + 10, len(entries))):
                 lookahead_sum += entries[j]['amount']
-                if math.isclose(entries[i]['amount'], lookahead_sum, rel_tol=0.01):
+                sub_items_count += 1
+                if sub_items_count > 0 and math.isclose(entries[i]['amount'], lookahead_sum, rel_tol=0.015):
                     indices_to_skip.add(i)
                     break
         return [entry for i, entry in enumerate(entries) if i not in indices_to_skip]
 
-    assets_details, liabilities_details, income_details = filter_totals(assets_data), filter_totals(liabilities_data), filter_totals(income_data)
+    assets_details = filter_totals(all_assets)
+    liabilities_details = filter_totals(all_liabilities)
+    costs_details = filter_totals(all_costs)
+    revenues_details = filter_totals(all_revenues)
     
+    income_details = costs_details + revenues_details
+
     final_assets, final_liabilities, final_income = [], [], []
+    
     for entry in assets_details: final_assets.append(f"{entry['name']},{entry['amount']}")
     for entry in liabilities_details: final_liabilities.append(f"{entry['name']},{entry['amount']}")
     for entry in income_details:
         item_name_lower = entry['name'].lower()
         ce_type = "Fisso"
-        if any(kw in item_name_lower for kw in KEYWORDS['income']['revenue']): ce_type = "Ricavo"
-        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
+        is_revenue = any(kw in item_name_lower for kw in KEYWORDS['income']['revenue'])
+        if is_revenue or entry in revenues_details:
+            ce_type = "Ricavo"
+        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']):
+            ce_type = "Variabile"
         final_income.append(f"{entry['name']},{entry['amount']},{ce_type}")
 
     return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-# --- FUNZIONE PER PARSING CSV AGGIORNATA ---
+# --- FUNZIONE PER PARSING CSV ---
 def parse_csv_file(csv_file):
-    """
-    Legge un file CSV e popola le aree di testo, gestendo diverse codifiche.
-    Colonne attese: Voce, Importo, Sezione, Tipo (opzionale)
-    """
     assets_data, liabilities_data, income_data = [], [], []
     try:
-        # Tenta di leggere il file con diverse codifiche comuni
         try:
-            df = pd.read_csv(csv_file) # Prova con utf-8 (default)
+            df = pd.read_csv(csv_file)
         except UnicodeDecodeError:
-            csv_file.seek(0) # Riporta il puntatore all'inizio del file
-            df = pd.read_csv(csv_file, encoding='latin-1') # Prova con latin-1 in caso di errore
-
-        # Standardizza i nomi delle colonne
-        df.columns = [col.strip().lower() for col in df.columns]
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file, encoding='latin-1')
         
+        df.columns = [col.strip().lower() for col in df.columns]
         required_cols = ['voce', 'importo', 'sezione']
         if not all(col in df.columns for col in required_cols):
             st.error(f"Il file CSV deve contenere le colonne: {', '.join(required_cols)}")
             return "", "", ""
             
         for _, row in df.iterrows():
-            voce = row['voce']
-            importo = row['importo']
-            sezione = row['sezione'].lower()
-            
-            if 'attivit' in sezione:
-                assets_data.append(f"{voce},{importo}")
-            elif 'passivit' in sezione or 'pn' in sezione:
-                 liabilities_data.append(f"{voce},{importo}")
+            voce, importo, sezione = row['voce'], row['importo'], row['sezione'].lower()
+            if 'attivit' in sezione: assets_data.append(f"{voce},{importo}")
+            elif 'passivit' in sezione or 'pn' in sezione: liabilities_data.append(f"{voce},{importo}")
             elif 'conto economico' in sezione:
-                tipo = row.get('tipo', 'Fisso') # Default a Fisso se la colonna Tipo manca
+                tipo = row.get('tipo', 'Fisso')
                 income_data.append(f"{voce},{importo},{tipo}")
-
         return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
-        
     except Exception as e:
         st.error(f"Errore nella lettura del file CSV: {e}")
         return "", "", ""
@@ -187,7 +201,6 @@ if 'income_text' not in st.session_state: st.session_state.income_text = ""
 
 with st.sidebar:
     st.header("1. Carica il Bilancio")
-    # File uploader accetta sia PDF che CSV
     uploaded_file = st.file_uploader("Seleziona un file PDF o CSV", type=["pdf", "csv"])
 
     with st.expander("❓ Formato CSV richiesto"):
@@ -195,15 +208,15 @@ with st.sidebar:
         Il file CSV deve avere le seguenti colonne:
         - **voce**: La descrizione della voce di bilancio.
         - **importo**: L'importo numerico.
-        - **sezione**: Dove va classificata la voce. Valori possibili: `Attività`, `Passività`, `PN`, `Conto Economico`.
-        - **tipo** (Opzionale): Solo per il Conto Economico. Valori: `Ricavo`, `Variabile`, `Fisso`.
+        - **sezione**: Dove va classificata la voce. Valori: `Attività`, `Passività`, `PN`, `Conto Economico`.
+        - **tipo** (Opzionale): Solo per il CE. Valori: `Ricavo`, `Variabile`, `Fisso`.
         """)
 
     if uploaded_file:
         with st.spinner('Estrazione dati dal file...'):
             file_type = uploaded_file.name.split('.')[-1].lower()
             if file_type == 'pdf':
-                assets, liabilities, income = extract_data_with_tables(uploaded_file)
+                assets, liabilities, income = extract_data_with_cropping(uploaded_file)
             elif file_type == 'csv':
                 assets, liabilities, income = parse_csv_file(uploaded_file)
             else:
@@ -295,7 +308,7 @@ if analyze_button:
         st.header("Risultati dell'Analisi")
         
         balance_diff = net_total_assets - total_liabilities_and_equity
-        if abs(balance_diff) < 10: # Tolleranza per arrotondamenti
+        if abs(balance_diff) < 20: # Tolleranza per arrotondamenti
             st.success(f"✅ **Controllo:** Il bilancio quadra correttamente! (Differenza: {format_currency(balance_diff)})")
         else:
             st.warning(f"⚠️ **Attenzione:** Il bilancio non quadra! Differenza: {format_currency(balance_diff)}")

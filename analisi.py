@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-# --- Funzioni di Analisi (adattate dal codice originale) ---
+# --- Funzioni di Analisi (con logica di riclassificazione) ---
 
 def is_attivo_corrente(descrizione: str) -> bool:
     """Verifica se una voce dell'attivo è da considerarsi corrente."""
@@ -32,74 +32,88 @@ def is_passivo_corrente(descrizione: str) -> bool:
 
 def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcola gli indicatori di bilancio (KPI) partendo da un DataFrame strutturato.
+    Calcola gli indicatori di bilancio (KPI) partendo da un DataFrame strutturato,
+    eseguendo una riclassificazione del bilancio.
     """
-    # Assicuriamoci che la colonna importo sia numerica, gestendo il formato italiano/europeo
-    # Rimuove il '.' per le migliaia e sostituisce ',' con '.' per i decimali.
-    if 'IMPORTO' in df.columns:
-        df['IMPORTO'] = df['IMPORTO'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-        df['IMPORTO'] = pd.to_numeric(df['IMPORTO'], errors='coerce').fillna(0)
+    # --- 1. Preparazione dei Dati ---
+    df['IMPORTO'] = df['IMPORTO'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+    df['IMPORTO'] = pd.to_numeric(df['IMPORTO'], errors='coerce').fillna(0)
+    # Colonna helper per confronti non case-sensitive
+    df['VOCE_LOWER'] = df['VOCE'].str.lower()
 
-    # Totali da Stato Patrimoniale
-    totale_attivita = df[df['SEZIONE'].str.upper() == "ATTIVITA'"]['IMPORTO'].sum()
-    totale_passivita = df[df['SEZIONE'].str.upper() == "PASSIVITA'"]['IMPORTO'].sum()
+    # --- 2. Suddivisione del DataFrame per Sezioni ---
+    df_attivo = df[df['SEZIONE'].str.upper() == "ATTIVITA'"].copy()
+    df_passivo_netto = df[df['SEZIONE'].str.upper() == "PASSIVITA'"].copy()
+    df_ce = df[df['SEZIONE'].str.upper() == "CONTO ECONOMICO"].copy()
 
-    # Calcolo Attivo e Passivo Corrente
-    df_attivo = df[df['SEZIONE'].str.upper() == "ATTIVITA'"]
-    attivo_corrente = df_attivo[df_attivo['VOCE'].apply(is_attivo_corrente)]['IMPORTO'].sum()
+    # --- 3. Riclassificazione e Calcolo Aggregati Stato Patrimoniale ---
+    totale_attivo_grezzo = df_attivo['IMPORTO'].sum()
 
-    df_passivo = df[df['SEZIONE'].str.upper() == "PASSIVITA'"]
-    passivo_corrente = df_passivo[df_passivo['VOCE'].apply(is_passivo_corrente)]['IMPORTO'].sum()
+    # Separazione delle componenti dal lato "PASSIVITA'" del file originale
+    fondi_ammortamento = df_passivo_netto[df_passivo_netto['VOCE_LOWER'].str.contains("f.do amm.|fondo amm")].IMPORTO.sum()
+    patrimonio_netto = df_passivo_netto[df_passivo_netto['VOCE_LOWER'].str.contains("capitale sociale|riserva|utile|perdita")].IMPORTO.sum()
     
-    # Dettagli per i calcoli
-    liquidita_immediate = df[df['VOCE'].str.lower().str.contains("depositi bancari|cassa|denaro e valori", regex=True)]['IMPORTO'].sum()
-    rimanenze = df[df['VOCE'].str.lower().str.contains("rimanenze", regex=True)]['IMPORTO'].sum()
+    # I debiti sono ciò che rimane nella sezione PASSIVITA' dopo aver tolto PN e Fondi Amm.
+    filtro_debiti = ~df_passivo_netto['VOCE_LOWER'].str.contains("f.do amm.|fondo amm|capitale sociale|riserva|utile|perdita")
+    df_debiti = df_passivo_netto[filtro_debiti]
+    debiti_totali = df_debiti.IMPORTO.sum()
 
-    # Totali da Conto Economico
-    df_ce = df[df['SEZIONE'].str.upper() == "CONTO ECONOMICO"]
+    totale_passivo_e_netto = debiti_totali + patrimonio_netto + fondi_ammortamento
     
-    ricavi = df_ce[df_ce['VOCE'].str.lower().str.contains("ricavi delle vendite|altri ricavi|contributi", regex=True)]['IMPORTO'].sum()
-    
-    # Funzione di supporto per sommare blocchi di costi
-    def sum_block(mask_regex: str) -> float:
-        block = df_ce[df_ce['VOCE'].str.lower().str.contains(mask_regex, regex=True)]
-        return float(block['IMPORTO'].sum())
+    # Calcolo aggregati dell'Attivo
+    attivo_corrente = df_attivo[df_attivo['VOCE'].apply(is_attivo_corrente)].IMPORTO.sum()
+    immobilizzazioni_lorde = totale_attivo_grezzo - attivo_corrente
+    immobilizzazioni_nette = immobilizzazioni_lorde - fondi_ammortamento
+    totale_attivo_riclassificato = immobilizzazioni_nette + attivo_corrente
 
-    costi_materie = sum_block("costi mat|acquisto di materie")
-    costi_servizi = sum_block("costi per servizi")
-    costi_godimento = sum_block("costi per godimento beni di terzi")
-    costi_personale = sum_block("costi per il personale|salari e stipendi|oneri sociali")
-    ammortamenti = sum_block("ammortamenti")
-    altri_costi = sum_block("oneri diversi|sopravvenienze passive|imposte e tasse")
+    # Dettagli dell'Attivo Corrente
+    liquidita_immediate = df_attivo[df_attivo['VOCE_LOWER'].str.contains("depositi bancari|cassa")].IMPORTO.sum()
+    rimanenze = df_attivo[df_attivo['VOCE_LOWER'].str.contains("rimanenze")].IMPORTO.sum()
 
-    # Calcolo Valore Aggiunto, EBITDA, EBIT
-    valore_produzione = ricavi 
-    valore_aggiunto = valore_produzione - (costi_materie + costi_servizi + costi_godimento + altri_costi)
+    # Calcolo aggregati del Passivo
+    passivo_corrente = df_debiti[df_debiti['VOCE'].apply(is_passivo_corrente)].IMPORTO.sum()
+    passivita_consolidate = debiti_totali - passivo_corrente
+
+    # --- 4. Riclassificazione Conto Economico a Valore Aggiunto ---
+    valore_produzione = df_ce[df_ce['VOCE_LOWER'].str.contains("ricavi|contributi|variazione rimanenze")].IMPORTO.sum()
+    costi_esterni = df_ce[df_ce['VOCE_LOWER'].str.contains("costi mat|acquisto di materie|costi per servizi|godimento beni")].IMPORTO.sum()
+    valore_aggiunto = valore_produzione - costi_esterni
+    costi_personale = df_ce[df_ce['VOCE_LOWER'].str.contains("personale|salari|stipendi|oneri sociali")].IMPORTO.sum()
     ebitda = valore_aggiunto - costi_personale
-    ebit = ebitda - ammortamenti
+    ammortamenti = df_ce[df_ce['VOCE_LOWER'].str.contains("ammortamenti")].IMPORTO.sum()
+    oneri_diversi_gestione = df_ce[df_ce['VOCE_LOWER'].str.contains("oneri diversi|perdite su crediti|sopravvenienze passive|imposte e tasse")].IMPORTO.sum()
+    ebit = ebitda - ammortamenti - oneri_diversi_gestione
 
-    # Calcolo Indici e Margini
+    # --- 5. Calcolo Indici, Margini e Controlli ---
+    ccn = attivo_corrente - passivo_corrente
+    margine_tesoreria = (attivo_corrente - rimanenze) - passivo_corrente
     current_ratio = (attivo_corrente / passivo_corrente) if passivo_corrente else 0
     quick_ratio = ((attivo_corrente - rimanenze) / passivo_corrente) if passivo_corrente else 0
-    ccn = attivo_corrente - passivo_corrente
-    margine_tesoreria = (liquidita_immediate + (attivo_corrente - liquidita_immediate - rimanenze)) - passivo_corrente
     ebitda_margin = (ebitda / valore_produzione) if valore_produzione else 0
-    
-    # Creazione del DataFrame di output
+    check_quadratura = totale_attivo_grezzo - totale_passivo_e_netto
+
+    # --- 6. Creazione del DataFrame di Output ---
     summary = {
-        "Stato Patrimoniale": "",
-        "Totale Attività": totale_attivita,
-        "Totale Passività": totale_passivita,
+        "Controllo Quadratura (Attivo - Passivo e Netto)": check_quadratura,
+        "--- Stato Patrimoniale Riclassificato ---": "",
+        "Immobilizzazioni Nette": immobilizzazioni_nette,
         "Attivo Corrente": attivo_corrente,
-        "Passivo Corrente": passivo_corrente,
-        "Liquidità Immediate": liquidita_immediate,
-        "Rimanenze": rimanenze,
-        "Conto Economico": "",
-        "Valore della Produzione (Ricavi)": valore_produzione,
+        "   di cui Liquidità Immediate": liquidita_immediate,
+        "   di cui Rimanenze": rimanenze,
+        "TOTALE ATTIVO RICLASSIFICATO": totale_attivo_riclassificato,
+        "Patrimonio Netto": patrimonio_netto,
+        "Passività Consolidate (M/L Termine)": passivita_consolidate,
+        "Passivo Corrente (Breve Termine)": passivo_corrente,
+        "TOTALE PASSIVO E NETTO": patrimonio_netto + debiti_totali,
+        "--- Conto Economico a Valore Aggiunto ---": "",
+        "Valore della Produzione": valore_produzione,
+        "Costi Esterni": costi_esterni,
         "Valore Aggiunto": valore_aggiunto,
+        "Costo del Personale": costi_personale,
         "EBITDA (Margine Operativo Lordo)": ebitda,
-        "EBIT (Margine Operativo Netto)": ebit,
-        "Indici e Margini": "",
+        "Ammortamenti e Altri Oneri": ammortamenti + oneri_diversi_gestione,
+        "EBIT (Risultato Operativo)": ebit,
+        "--- Indici e Margini ---": "",
         "Capitale Circolante Netto (CCN)": ccn,
         "Margine di Tesoreria": margine_tesoreria,
         "Current Ratio": f"{current_ratio:.2f}",
@@ -112,6 +126,7 @@ def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- Interfaccia Streamlit ---
+# (Il resto del codice rimane invariato)
 
 st.set_page_config(page_title="Analisi di Bilancio", layout="wide", initial_sidebar_state="collapsed")
 
@@ -128,7 +143,6 @@ if uploaded_file is not None:
     try:
         # Lettura del file caricato
         if uploaded_file.name.endswith('.csv'):
-            # Prova diversi separatori comuni per i CSV italiani
             try:
                 df = pd.read_csv(uploaded_file, sep=';')
             except Exception:
@@ -136,12 +150,9 @@ if uploaded_file is not None:
         else:
             df = pd.read_excel(uploaded_file)
 
-        # --- FIX: Assicura che la colonna VOCE sia di tipo stringa per evitare errori ---
-        # Converte la colonna 'VOCE' in stringa, gestendo valori mancanti (NaN)
-        # che altrimenti causerebbero l'errore "'float' object has no attribute 'lower'".
+        # Assicura che la colonna VOCE sia di tipo stringa per evitare errori
         if 'VOCE' in df.columns:
             df['VOCE'] = df['VOCE'].astype(str).fillna('')
-
 
         # Validazione delle colonne necessarie
         required_columns = ['VOCE', 'IMPORTO', 'SEZIONE']
@@ -149,25 +160,25 @@ if uploaded_file is not None:
             st.error(f"Errore: Il file deve contenere le seguenti colonne: {', '.join(required_columns)}")
         else:
             with st.spinner('Elaborazione in corso...'):
-                # Calcolo dei KPI
                 kpis_df = calculate_kpis(df)
 
                 st.success("Analisi completata!")
 
-                # Visualizzazione dei risultati
                 st.subheader("Indicatori e Margini di Bilancio (KPIs)")
                 
                 # Formattazione per la visualizzazione
                 formatted_kpis = kpis_df.copy()
                 
                 def format_value(row):
+                    # Formatta solo se il valore è un numero (int o float)
                     if isinstance(row['Valore'], (int, float)):
-                        return f"€ {row['Valore']:,.2f}"
+                         # Usa la virgola come separatore delle migliaia e il punto per i decimali, con 2 cifre decimali
+                        return f"€ {row['Valore']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
                     return row['Valore']
 
                 formatted_kpis['Valore'] = formatted_kpis.apply(format_value, axis=1)
-
-                # Rimuovi le righe che fungono da separatori
+                
+                # Rimuovi le righe che fungono da separatori/titoli di sezione
                 formatted_kpis = formatted_kpis[formatted_kpis['Valore'] != '']
                 
                 st.dataframe(
@@ -178,12 +189,12 @@ if uploaded_file is not None:
                 )
 
                 st.subheader("Dati originali caricati")
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.dataframe(df.drop(columns=['VOCE_LOWER']), use_container_width=True, hide_index=True)
 
                 # Funzionalità di download
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, sheet_name='Dati Originali', index=False)
+                    df.drop(columns=['VOCE_LOWER']).to_excel(writer, sheet_name='Dati Originali', index=False)
                     kpis_df.to_excel(writer, sheet_name='Analisi KPI', index=False)
                 
                 st.download_button(

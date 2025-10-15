@@ -62,7 +62,7 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- NUOVO MOTORE DI ESTRAZIONE CHE RICONOSCE IL GRASSETTO ---
+# --- MOTORE DI ESTRAZIONE CHE RICONOSCE IL GRASSETTO (CON CORREZIONE ERRORE) ---
 def extract_data_with_formatting(pdf_file):
     """
     Estrae dati da un PDF analizzando la formattazione (grassetto) per
@@ -73,7 +73,9 @@ def extract_data_with_formatting(pdf_file):
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
         is_ce_section = False
         for page in pdf.pages:
-            if "CONTO ECONOMICO" in page.extract_text():
+            # Rileva se la pagina appartiene al Conto Economico
+            page_text_for_section_check = page.extract_text()
+            if page_text_for_section_check and "CONTO ECONOMICO" in page_text_for_section_check:
                 is_ce_section = True
 
             mid_point = page.width / 2
@@ -96,8 +98,9 @@ def extract_data_with_formatting(pdf_file):
                     line_words = sorted(lines[top], key=lambda w: w['x0'])
                     line_text = " ".join(w['text'] for w in line_words)
                     
-                    # Rileva se la linea contiene testo in grassetto
-                    is_bold = any("Bold" in w['fontname'] for w in line_words)
+                    # --- CORREZIONE ERRORE ---
+                    # Controlla in modo sicuro se 'fontname' esiste prima di accedervi.
+                    is_bold = any("Bold" in w.get('fontname', '') for w in line_words)
                     
                     pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$")
                     match = pattern.search(line_text)

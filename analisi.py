@@ -34,7 +34,9 @@ def calculate_kpis(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcola gli indicatori di bilancio (KPI) partendo da un DataFrame strutturato.
     """
-    # Assicuriamoci che la colonna importo sia numerica
+    # Assicuriamoci che la colonna importo sia numerica, gestendo il formato italiano/europeo
+    # Rimuove il '.' per le migliaia e sostituisce ',' con '.' per i decimali.
+    df['IMPORTO'] = df['IMPORTO'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
     df['IMPORTO'] = pd.to_numeric(df['IMPORTO'], errors='coerce').fillna(0)
 
     # Totali da Stato Patrimoniale
@@ -188,3 +190,4 @@ if uploaded_file is not None:
         st.warning("Assicurati che il file sia nel formato corretto e non sia corrotto.")
 else:
     st.info("In attesa di un file di bilancio per iniziare l'analisi.")
+

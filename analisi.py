@@ -41,13 +41,13 @@ KEYWORDS = {
     },
     'liabilities': {
         'current': ['debiti', 'fornitori', 'tributari', 'erario', 'inps', 'inail', 'dipendenti', 'ratei passivi', 'risconti passivi', 'banche c/c passivi'],
-        'non_current': ['mutui', 'finanziamenti', 'tfr', 'trattamento fine rapporto'],
+        'non_current': ['mutui', 'finanziamenti', 'tfr', 'trattamento fine rapporto', 'f.do amm', 'fondo amm'],
         'equity': ['capitale', 'riserve', 'utile', 'perdita', 'patrimonio netto']
     },
     'income': {
          'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione'],
          'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie'],
-         'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi']
+         'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi', 'sanzioni', 'multe', 'abbonamenti']
     }
 }
 
@@ -63,53 +63,61 @@ def extract_text_from_pdf(pdf_file):
         st.error(f"Errore nella lettura del PDF: {e}")
         return ""
 
+# --- SEZIONE MODIFICATA: Parsing Migliorato ---
 def parse_financial_text(text):
-    """Analizza il testo estratto per trovare voci e importi finanziari."""
-    assets_data, liabilities_data, income_data = "", "", ""
+    """
+    Analizza il testo estratto per trovare tutte le coppie voce-importo,
+    anche quando sono multiple sulla stessa riga.
+    """
+    assets_data, liabilities_data, income_data = [], [], []
     
-    # Regex per trovare una descrizione testuale seguita da un importo numerico
-    # Gestisce numeri come 1.234,56 o 1,234.56 o 1234.56
-    line_regex = re.compile(r"^(.*?)\s+([\d.,\s]+?[\d])\s*$")
+    # Regex migliorata per trovare una descrizione (non numerica) seguita da un importo.
+    # Cerca tutte le occorrenze, non solo una per riga.
+    pattern = re.compile(r"([a-zA-Z\s.,()'-/]+?)\s+([\d.,]+[\d])")
 
     for line in text.split('\n'):
-        line = line.strip()
-        match = line_regex.match(line)
+        # Rimuove codici numerici iniziali (es. '13090000 - ') che possono confondere il parser
+        cleaned_line = re.sub(r'^\d+\s*-\s*', '', line.strip())
         
-        if match:
-            item_name = match.group(1).strip().lower()
-            amount_str = match.group(2).strip()
+        matches = pattern.findall(cleaned_line)
+        
+        for match in matches:
+            item_name = match[0].strip()
+            amount_str = match[1].strip()
 
-            # Pulisce l'importo: rimuove spazi, punti (migliaia) e sostituisce la virgola con il punto decimale
+            # Pulisce l'importo e lo converte in float
             try:
-                # Gestisce formati come "1.234,56" -> "1234.56"
                 amount = float(amount_str.replace('.', '').replace(',', '.'))
             except ValueError:
-                continue # Salta se la conversione fallisce
+                continue
 
             if len(item_name) < 4 or amount == 0:
                 continue
 
+            item_name_lower = item_name.lower()
+            entry = f"{item_name},{amount}"
+
             # Classificazione basata su keyword
             found = False
-            # Stato Patrimoniale - Attività
-            if any(kw in item_name for kw in KEYWORDS['assets']['current'] + KEYWORDS['assets']['non_current']):
-                assets_data += f"{match.group(1).strip()},{amount}\n"
+            if any(kw in item_name_lower for kw in KEYWORDS['assets']['current'] + KEYWORDS['assets']['non_current']):
+                assets_data.append(entry)
                 found = True
-            # Stato Patrimoniale - Passività e PN
-            if not found and any(kw in item_name for kw in KEYWORDS['liabilities']['current'] + KEYWORDS['liabilities']['non_current'] + KEYWORDS['liabilities']['equity']):
-                liabilities_data += f"{match.group(1).strip()},{amount}\n"
+            elif any(kw in item_name_lower for kw in KEYWORDS['liabilities']['current'] + KEYWORDS['liabilities']['non_current'] + KEYWORDS['liabilities']['equity']):
+                # I fondi ammortamento sono passività (rettificative), ma spesso estratti accanto alle immobilizzazioni.
+                # Questa regola li sposta nel passivo.
+                liabilities_data.append(entry)
                 found = True
-            # Conto Economico
+            
             if not found:
                 ce_type = "Fisso"
-                if any(kw in item_name for kw in KEYWORDS['income']['revenue']):
+                if any(kw in item_name_lower for kw in KEYWORDS['income']['revenue']):
                     ce_type = "Ricavo"
-                elif any(kw in item_name for kw in KEYWORDS['income']['variable']):
+                elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']):
                     ce_type = "Variabile"
-                
-                income_data += f"{match.group(1).strip()},{amount},{ce_type}\n"
+                income_data.append(f"{entry},{ce_type}")
 
-    return assets_data, liabilities_data, income_data
+    return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
+# --- FINE SEZIONE MODIFICATA ---
 
 def parse_textarea_data(text):
     """Converte il testo delle textarea in una lista di dizionari."""
@@ -121,17 +129,20 @@ def parse_textarea_data(text):
             item = parts[0].strip()
             amount = float(parts[1].strip())
             ce_type = parts[2].strip().capitalize() if len(parts) > 2 else None
+            # I fondi ammortamento sono costi rettificativi, li trattiamo come negativi nel passivo.
+            if "f.do amm" in item.lower() or "fondo amm" in item.lower():
+                amount = -abs(amount)
             data.append({'item': item, 'amount': amount, 'type': ce_type})
         except (ValueError, IndexError):
-            st.warning(f"Riga ignorata per formato non valido: '{line}'")
+            # Non mostrare più warning per ogni riga, ma uno generale se l'analisi fallisce.
+            pass
     return data
 
 # --- INTERFACCIA UTENTE (UI) ---
-
+# ... (Il resto del codice rimane identico a prima) ...
 st.title("📊 Analisi di Bilancio Automatizzata")
 st.markdown("Carica un bilancio in formato PDF per estrarre e analizzare i dati automaticamente, oppure inseriscili manualmente.")
 
-# Creazione di session state per mantenere i dati
 if 'assets_text' not in st.session_state:
     st.session_state.assets_text = ""
 if 'liabilities_text' not in st.session_state:
@@ -181,7 +192,6 @@ with st.sidebar:
 
     analyze_button = st.button("🚀 Elabora Analisi", use_container_width=True)
 
-# --- ZONA DI VISUALIZZAZIONE RISULTATI ---
 if not analyze_button:
     st.info("Carica un PDF o inserisci i dati nella barra laterale e clicca 'Elabora Analisi' per visualizzare i risultati.")
 
@@ -193,9 +203,6 @@ if analyze_button:
     if not assets_data or not liabilities_data or not income_data:
         st.error("Dati insufficienti. Compila tutti i campi richiesti nella barra laterale.")
     else:
-        # --- ELABORAZIONE E CALCOLO ---
-
-        # 1. Riclassificazione Stato Patrimoniale
         bs = {
             'current_assets': sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['current'])),
             'non_current_assets': sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['non_current'])),
@@ -204,11 +211,9 @@ if analyze_button:
             'equity': sum(d['amount'] for d in liabilities_data if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['equity'])),
         }
         total_assets = bs['current_assets'] + bs['non_current_assets']
-        total_liabilities = bs['current_liabilities'] + bs['non_current_liabilities']
-        total_liabilities_and_equity = total_liabilities + bs['equity']
+        total_liabilities = bs['current_liabilities'] + bs['non_current_liabilities'] + bs['equity']
         rimanenze = sum(d['amount'] for d in assets_data if 'rimanenze' in d['item'].lower() or 'scorte' in d['item'].lower())
-
-        # 2. Riclassificazione Conto Economico
+        
         income = {
             'revenues': sum(d['amount'] for d in income_data if d['type'] == 'Ricavo'),
             'variable_costs': sum(d['amount'] for d in income_data if d['type'] == 'Variabile'),
@@ -220,31 +225,30 @@ if analyze_button:
         ebt = ebit - interest
         taxes = ebt * tax_rate if ebt > 0 else 0
         net_income = ebt - taxes
+        
+        total_liabilities_and_equity = bs['current_liabilities'] + bs['non_current_liabilities'] + bs['equity']
 
-        # 3. Calcolo Indici
         ratios = {
             'current_ratio': bs['current_assets'] / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
             'quick_ratio': (bs['current_assets'] - rimanenze) / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
-            'debt_to_equity': total_liabilities / bs['equity'] if bs['equity'] > 0 else 0,
+            'debt_to_equity': (bs['current_liabilities'] + bs['non_current_liabilities']) / bs['equity'] if bs['equity'] > 0 else 0,
             'ros': ebit / income['revenues'] if income['revenues'] > 0 else 0,
             'roe': net_income / bs['equity'] if bs['equity'] > 0 else 0,
-            'roi': ebit / total_assets if total_assets > 0 else 0,
+            'roi': ebit / (total_assets) if total_assets > 0 else 0,
             'contribution_margin_ratio': contribution_margin / income['revenues'] if income['revenues'] > 0 else 0,
             'break_even_point': income['fixed_costs'] / (contribution_margin / income['revenues']) if contribution_margin > 0 else 0
         }
 
-        # --- VISUALIZZAZIONE ---
         st.header("Risultati dell'Analisi")
         
-        # Controllo quadratura
         balance_diff = total_assets - total_liabilities_and_equity
-        if abs(balance_diff) > 1: # Tolleranza di 1 euro
+        if abs(balance_diff) > 1:
             st.warning(f"⚠️ **Attenzione:** Il bilancio non quadra! Differenza: {format_currency(balance_diff)}")
         else:
             st.success("✅ **Controllo:** Il bilancio quadra correttamente.")
 
         tab1, tab2, tab3 = st.tabs(["📈 Dashboard Indici", "📑 Stato Patrimoniale", "💰 Conto Economico"])
-
+        
         with tab1:
             st.subheader("Dashboard Indici Principali")
             cols = st.columns(3)

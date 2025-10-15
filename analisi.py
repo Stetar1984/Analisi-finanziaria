@@ -57,106 +57,118 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- NUOVO MOTORE DI ESTRAZIONE PER BILANCIO DI VERIFICA ---
-def extract_data_from_verification_balance(pdf_file):
-    """
-    Estrae dati da un bilancio di verifica (formato DARE/AVERE/SALDO),
-    ignorando le voci in maiuscolo (macro-categorie).
-    """
-    assets_data, liabilities_data, income_data = [], [], []
-    
+# --- MOTORE DI ESTRAZIONE PDF CHE RICONOSCE IL GRASSETTO ---
+def extract_data_with_formatting(pdf_file):
+    all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
-        parsing_mode = 'SP'  # Inizia in modalità Stato Patrimoniale
-
+        is_ce_section = False
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    # Una riga valida ha almeno 4 colonne: DESCRIZIONE, DARE, AVERE, SALDO
-                    if len(row) < 4: continue
-                    
-                    desc, dare, avere, saldo_str = row[0], row[1], row[2], row[3]
+            page_text_for_section_check = page.extract_text()
+            if page_text_for_section_check and "CONTO ECONOMICO" in page_text_for_section_check:
+                is_ce_section = True
+            mid_point = page.width / 2
+            left_bbox, right_bbox = (0, 0, mid_point, page.height), (mid_point, 0, page.width, page.height)
+            def process_column(column_bbox, target_list):
+                words = page.crop(column_bbox).extract_words(x_tolerance=2, y_tolerance=2)
+                if not words: return
+                lines = {}
+                for word in words:
+                    top = round(word['top'])
+                    if top not in lines: lines[top] = []
+                    lines[top].append(word)
+                for top in sorted(lines.keys()):
+                    line_words = sorted(lines[top], key=lambda w: w['x0'])
+                    line_text = " ".join(w['text'] for w in line_words)
+                    is_bold = any("Bold" in w.get('fontname', '') for w in line_words)
+                    pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$")
+                    match = pattern.search(line_text)
+                    if match:
+                        item_name = re.sub(r'^\d+\s*[-\s]*', '', match.group(1).strip())
+                        amount = clean_and_convert_amount(match.group(2))
+                        if amount is not None and len(item_name) > 3 and not item_name.lower().startswith('totale') and not is_bold:
+                            target_list.append({'name': item_name, 'amount': amount})
+            if is_ce_section:
+                process_column(left_bbox, all_costs)
+                process_column(right_bbox, all_revenues)
+            else:
+                process_column(left_bbox, all_assets)
+                process_column(right_bbox, all_liabilities)
+    income_details = all_costs + all_revenues
+    final_assets, final_liabilities, final_income = [], [], []
+    for entry in all_assets: final_assets.append(f"{entry['name']},{entry['amount']}")
+    for entry in all_liabilities: final_liabilities.append(f"{entry['name']},{entry['amount']}")
+    for entry in income_details:
+        item_name_lower = entry['name'].lower()
+        ce_type = "Fisso"
+        is_revenue = any(kw in item_name_lower for kw in KEYWORDS['income']['revenue'])
+        if is_revenue or entry in all_revenues: ce_type = "Ricavo"
+        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
+        final_income.append(f"{entry['name']},{entry['amount']},{ce_type}")
+    return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-                    # Logica di cambio sezione
-                    if desc and 'TOTALE CONTI PATRIMONIALI' in desc:
-                        parsing_mode = 'CE'
-                        continue
-                    if desc and ('TOTALE CONTI ECONOMICI' in desc or 'TOTALE GENERALE' in desc):
-                        continue # Fine dei dati utili per questa pagina
-
-                    # Salta righe invalide o di intestazione
-                    if not desc or desc.strip() == "DESCRIZIONE": continue
-                    
-                    # Pulisce la descrizione da codici e spazi extra
-                    desc = re.sub(r'^\d+\s*[-\s]*', '', desc.replace('\n', ' ')).strip()
-                    
-                    # --- REGOLA CHIAVE: IGNORA LE MACRO-CATEGORIE IN MAIUSCOLO ---
-                    if desc == desc.upper() and len(desc) > 1 and not any(char.isdigit() for char in desc):
-                        continue
-                        
-                    # Estrae l'importo e il tipo di saldo (D/A)
-                    if saldo_str:
-                        saldo_parts = saldo_str.strip().split()
-                        if len(saldo_parts) >= 2: # Deve avere almeno importo e tipo
-                            amount = clean_and_convert_amount(saldo_parts[0])
-                            saldo_type = saldo_parts[-1].upper() # Prende l'ultimo elemento
-                            
-                            if amount is None: continue
-                            
-                            item_name_lower = desc.lower()
-                            entry_str = f"{desc},{amount}"
-                            
-                            if saldo_type == 'D': # DARE = Attività o Costo
-                                if parsing_mode == 'SP':
-                                    assets_data.append(entry_str)
-                                else:
-                                    ce_type = "Fisso"
-                                    if any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
-                                    income_data.append(f"{entry_str},{ce_type}")
-                                    
-                            elif saldo_type == 'A': # AVERE = Passività, PN o Ricavo
-                                if parsing_mode == 'SP':
-                                    liabilities_data.append(entry_str)
-                                else:
-                                    income_data.append(f"{entry_str},Ricavo")
-
-    return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
-
-
-# --- FUNZIONE PER PARSING CSV ---
+# --- FUNZIONE PER PARSING CSV OTTIMIZZATA ---
 def parse_csv_file(csv_file):
     assets_data, liabilities_data, income_data = [], [], []
     csv_content = csv_file.read()
     df = None
-    configs = [{'encoding': 'utf-8', 'sep': ','}, {'encoding': 'utf-8', 'sep': ';'}, {'encoding': 'latin-1', 'sep': ','}, {'encoding': 'latin-1', 'sep': ';'}]
+    
+    # Lista di configurazioni da provare
+    configs = [
+        {'encoding': 'utf-8', 'sep': None}, # Auto-detect separator for utf-8
+        {'encoding': 'latin-1', 'sep': None} # Auto-detect separator for latin-1
+    ]
+
     for config in configs:
         try:
-            df = pd.read_csv(io.BytesIO(csv_content), encoding=config['encoding'], sep=config['sep'], engine='python')
+            # Usa il motore python che è più flessibile e l'opzione on_bad_lines per saltare le righe errate
+            df = pd.read_csv(io.BytesIO(csv_content), 
+                           encoding=config['encoding'], 
+                           sep=config['sep'], 
+                           engine='python',
+                           on_bad_lines='skip')
+            
+            # Controlla se le colonne necessarie sono state trovate
             if 'voce' in [c.lower().strip() for c in df.columns]:
-                break
+                break # Successo, esce dal ciclo
             else:
-                df = None
-        except (UnicodeDecodeError, pd.errors.ParserError):
-            csv_file.seek(0)
+                df = None # Resetta df se le colonne non sono corrette
+        except Exception:
+            # Resetta il puntatore del file per il prossimo tentativo
+            csv_file.seek(0) 
             csv_content = csv_file.read()
-            continue
+            continue # Prova la configurazione successiva
+
     if df is None:
         st.error("Errore critico: Impossibile analizzare il file CSV.")
+        st.info("Consiglio: Assicurati che il file sia un CSV valido con separatore virgola (,) o punto e virgola (;) e che la prima riga contenga i titoli di colonna corretti (voce, importo, sezione, tipo).")
         return "", "", ""
+
     df.columns = [col.strip().lower() for col in df.columns]
+    
     required_cols = ['voce', 'importo', 'sezione']
     if not all(col in df.columns for col in required_cols):
         found_cols = ', '.join(df.columns)
-        st.error(f"Errore nelle colonne del CSV. Richieste: {required_cols}. Trovate: {found_cols}")
+        st.error(f"Errore nelle colonne del CSV.")
+        st.error(f"**Colonne richieste:** {', '.join(required_cols)}")
+        st.error(f"**Colonne trovate nel tuo file:** {found_cols}")
+        st.info("Assicurati che la prima riga del tuo file CSV contenga esattamente quei nomi di colonna.")
         return "", "", ""
+        
     for _, row in df.iterrows():
-        voce, importo, sezione = row['voce'], row['importo'], row['sezione'].lower()
-        if 'attivit' in sezione: assets_data.append(f"{voce},{importo}")
-        elif 'passivit' in sezione or 'pn' in sezione: liabilities_data.append(f"{voce},{importo}")
+        voce = row['voce']
+        importo = row['importo']
+        sezione = row['sezione'].lower()
+        
+        if 'attivit' in sezione:
+            assets_data.append(f"{voce},{importo}")
+        elif 'passivit' in sezione or 'pn' in sezione:
+             liabilities_data.append(f"{voce},{importo}")
         elif 'conto economico' in sezione:
             tipo = row.get('tipo', 'Fisso')
             income_data.append(f"{voce},{importo},{tipo}")
+
     return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
+
 
 def parse_textarea_data(text):
     data = []
@@ -197,7 +209,7 @@ with st.sidebar:
         with st.spinner('Estrazione dati dal file...'):
             file_type = uploaded_file.name.split('.')[-1].lower()
             if file_type == 'pdf':
-                assets, liabilities, income = extract_data_from_verification_balance(uploaded_file)
+                assets, liabilities, income = extract_data_with_formatting(uploaded_file)
             elif file_type == 'csv':
                 assets, liabilities, income = parse_csv_file(uploaded_file)
             else:

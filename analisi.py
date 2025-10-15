@@ -55,7 +55,7 @@ KEYWORDS = {
 def clean_and_convert_amount(amount_str):
     if not amount_str: return None
     try:
-        cleaned_str = amount_str.strip()
+        cleaned_str = str(amount_str).strip()
         if '.' in cleaned_str and ',' in cleaned_str:
             if cleaned_str.rfind('.') > cleaned_str.rfind(','):
                 return float(cleaned_str.replace(',', ''))
@@ -65,62 +65,37 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- NUOVO MOTORE DI ESTRAZIONE BASATO SU TABELLE ---
+# --- MOTORE DI ESTRAZIONE PDF BASATO SU TABELLE ---
 def extract_data_with_tables(pdf_file):
-    """
-    Estrae dati da un PDF usando l'estrazione tabellare di pdfplumber per
-    mantenere la struttura a colonne e risolvere il problema della lettura errata.
-    """
     assets_data, liabilities_data, income_data = [], [], []
-
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
         is_ce_section = False
         for page in pdf.pages:
             full_text = page.extract_text()
             if "CONTO ECONOMICO" in full_text:
                 is_ce_section = True
-            
-            # Estrae tabelle dalla pagina
             tables = page.extract_tables()
             for table in tables:
                 for row in table:
-                    if is_ce_section: # Se siamo nel Conto Economico
-                        # Ci aspettiamo 4 colonne: Desc Costi, Imp Costi, Desc Ricavi, Imp Ricavi
+                    if is_ce_section:
                         if len(row) < 4: continue
-                        cost_desc, cost_amount_str = row[0], row[1]
-                        rev_desc, rev_amount_str = row[2], row[3]
-                        
-                        # Processa la colonna Costi
+                        cost_desc, cost_amount_str, rev_desc, rev_amount_str = row[0], row[1], row[2], row[3]
                         if cost_desc and cost_amount_str:
                             cost_amount = clean_and_convert_amount(cost_amount_str)
-                            if cost_amount:
-                                income_data.append({'name': cost_desc.replace('\n', ' '), 'amount': cost_amount})
-                        
-                        # Processa la colonna Ricavi
+                            if cost_amount: income_data.append({'name': cost_desc.replace('\n', ' '), 'amount': cost_amount})
                         if rev_desc and rev_amount_str:
                             rev_amount = clean_and_convert_amount(rev_amount_str)
-                            if rev_amount:
-                                income_data.append({'name': rev_desc.replace('\n', ' '), 'amount': rev_amount})
-                    
-                    else: # Se siamo nello Stato Patrimoniale
-                        # Ci aspettiamo 4 colonne: Desc Attività, Imp Attività, Desc Passività, Imp Passività
+                            if rev_amount: income_data.append({'name': rev_desc.replace('\n', ' '), 'amount': rev_amount})
+                    else:
                         if len(row) < 4: continue
-                        asset_desc, asset_amount_str = row[0], row[1]
-                        liab_desc, liab_amount_str = row[2], row[3]
-
-                        # Processa la colonna Attività
+                        asset_desc, asset_amount_str, liab_desc, liab_amount_str = row[0], row[1], row[2], row[3]
                         if asset_desc and asset_amount_str:
                             asset_amount = clean_and_convert_amount(asset_amount_str)
-                            if asset_amount:
-                                assets_data.append({'name': asset_desc.replace('\n', ' '), 'amount': asset_amount})
-
-                        # Processa la colonna Passività
+                            if asset_amount: assets_data.append({'name': asset_desc.replace('\n', ' '), 'amount': asset_amount})
                         if liab_desc and liab_amount_str:
                             liab_amount = clean_and_convert_amount(liab_amount_str)
-                            if liab_amount:
-                                liabilities_data.append({'name': liab_desc.replace('\n', ' '), 'amount': liab_amount})
-
-    # --- Filtro Intelligente per Rimuovere le Macro-Categorie (Totali) ---
+                            if liab_amount: liabilities_data.append({'name': liab_desc.replace('\n', ' '), 'amount': liab_amount})
+    
     def filter_totals(entries):
         indices_to_skip = set()
         for i in range(len(entries)):
@@ -132,19 +107,11 @@ def extract_data_with_tables(pdf_file):
                     break
         return [entry for i, entry in enumerate(entries) if i not in indices_to_skip]
 
-    assets_details = filter_totals(assets_data)
-    liabilities_details = filter_totals(liabilities_data)
-    income_details = filter_totals(income_data)
-
-    # --- Classificazione e Formattazione Finale ---
-    final_assets, final_liabilities, final_income = [], [], []
+    assets_details, liabilities_details, income_details = filter_totals(assets_data), filter_totals(liabilities_data), filter_totals(income_data)
     
-    for entry in assets_details:
-        final_assets.append(f"{entry['name']},{entry['amount']}")
-        
-    for entry in liabilities_details:
-        final_liabilities.append(f"{entry['name']},{entry['amount']}")
-        
+    final_assets, final_liabilities, final_income = [], [], []
+    for entry in assets_details: final_assets.append(f"{entry['name']},{entry['amount']}")
+    for entry in liabilities_details: final_liabilities.append(f"{entry['name']},{entry['amount']}")
     for entry in income_details:
         item_name_lower = entry['name'].lower()
         ce_type = "Fisso"
@@ -153,6 +120,42 @@ def extract_data_with_tables(pdf_file):
         final_income.append(f"{entry['name']},{entry['amount']},{ce_type}")
 
     return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
+
+# --- NUOVA FUNZIONE PER PARSING CSV ---
+def parse_csv_file(csv_file):
+    """
+    Legge un file CSV e popola le aree di testo.
+    Colonne attese: Voce, Importo, Sezione, Tipo (opzionale)
+    """
+    assets_data, liabilities_data, income_data = [], [], []
+    try:
+        df = pd.read_csv(csv_file)
+        # Standardizza i nomi delle colonne
+        df.columns = [col.strip().lower() for col in df.columns]
+        
+        required_cols = ['voce', 'importo', 'sezione']
+        if not all(col in df.columns for col in required_cols):
+            st.error(f"Il file CSV deve contenere le colonne: {', '.join(required_cols)}")
+            return "", "", ""
+            
+        for _, row in df.iterrows():
+            voce = row['voce']
+            importo = row['importo']
+            sezione = row['sezione'].lower()
+            
+            if 'attivit' in sezione:
+                assets_data.append(f"{voce},{importo}")
+            elif 'passivit' in sezione or 'pn' in sezione:
+                 liabilities_data.append(f"{voce},{importo}")
+            elif 'conto economico' in sezione:
+                tipo = row.get('tipo', 'Fisso') # Default a Fisso se la colonna Tipo manca
+                income_data.append(f"{voce},{importo},{tipo}")
+
+        return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
+        
+    except Exception as e:
+        st.error(f"Errore nella lettura del file CSV: {e}")
+        return "", "", ""
 
 def parse_textarea_data(text):
     data = []
@@ -170,19 +173,37 @@ def parse_textarea_data(text):
 
 # --- INTERFACCIA UTENTE (UI) ---
 st.title("📊 Analisi di Bilancio Automatizzata")
-st.markdown("Carica un bilancio in formato PDF per estrarre e analizzare i dati automaticamente, oppure inseriscili manualmente.")
+st.markdown("Carica un bilancio in formato PDF o CSV, oppure inserisci i dati manualmente.")
 
 if 'assets_text' not in st.session_state: st.session_state.assets_text = ""
 if 'liabilities_text' not in st.session_state: st.session_state.liabilities_text = ""
 if 'income_text' not in st.session_state: st.session_state.income_text = ""
 
 with st.sidebar:
-    st.header("1. Carica Bilancio PDF")
-    uploaded_file = st.file_uploader("Seleziona un PDF", type="pdf")
+    st.header("1. Carica il Bilancio")
+    # File uploader accetta sia PDF che CSV
+    uploaded_file = st.file_uploader("Seleziona un file PDF o CSV", type=["pdf", "csv"])
+
+    with st.expander("❓ Formato CSV richiesto"):
+        st.info("""
+        Il file CSV deve avere le seguenti colonne:
+        - **voce**: La descrizione della voce di bilancio.
+        - **importo**: L'importo numerico.
+        - **sezione**: Dove va classificata la voce. Valori possibili: `Attività`, `Passività`, `PN`, `Conto Economico`.
+        - **tipo** (Opzionale): Solo per il Conto Economico. Valori: `Ricavo`, `Variabile`, `Fisso`.
+        """)
 
     if uploaded_file:
-        with st.spinner('Estrazione dati dal PDF in corso...'):
-            assets, liabilities, income = extract_data_with_tables(uploaded_file)
+        with st.spinner('Estrazione dati dal file...'):
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            if file_type == 'pdf':
+                assets, liabilities, income = extract_data_with_tables(uploaded_file)
+            elif file_type == 'csv':
+                assets, liabilities, income = parse_csv_file(uploaded_file)
+            else:
+                assets, liabilities, income = "", "", ""
+                st.error("Formato file non supportato.")
+            
             st.session_state.assets_text = assets
             st.session_state.liabilities_text = liabilities
             st.session_state.income_text = income
@@ -201,7 +222,7 @@ with st.sidebar:
     analyze_button = st.button("🚀 Elabora Analisi", use_container_width=True)
 
 if not analyze_button:
-    st.info("Carica un PDF o inserisci i dati nella barra laterale e clicca 'Elabora Analisi' per visualizzare i risultati.")
+    st.info("Carica un file o inserisci i dati nella barra laterale e clicca 'Elabora Analisi' per visualizzare i risultati.")
 
 if analyze_button:
     assets_data = parse_textarea_data(st.session_state.assets_text)

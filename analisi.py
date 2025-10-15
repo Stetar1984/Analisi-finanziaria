@@ -15,19 +15,16 @@ st.set_page_config(
 
 # --- FUNZIONI DI FORMATTAZIONE ---
 def format_currency(value):
-    """Formatta un numero come valuta in Euro."""
     if pd.isna(value) or not isinstance(value, (int, float)):
         return "€ 0,00"
     return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def format_decimal(value):
-    """Formatta un numero con due decimali."""
     if pd.isna(value) or not isinstance(value, (int, float)):
         return "N/A"
     return f"{value:.2f}"
 
 def format_percent(value):
-    """Formatta un numero come percentuale."""
     if pd.isna(value) or not isinstance(value, (int, float)):
         return "N/A"
     return f"{(value * 100):.2f}%"
@@ -44,7 +41,7 @@ KEYWORDS = {
         'non_current': ['mutui', 'finanziamenti', 'tfr', 'trattamento fine rapporto'],
         'equity': ['capitale', 'riserve', 'utile', 'perdita', 'patrimonio netto']
     },
-    'special_negative': ['f.do amm', 'fondo amm'], # Voci che sono rettificative dell'attivo
+    'special_negative': ['f.do amm', 'fondo amm'],
     'income': {
          'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione', 'proventi', 'contributi in conto esercizio', 'altri ricavi'],
          'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie', 'rim.fin', 'rim.iniz'],
@@ -65,79 +62,71 @@ def clean_and_convert_amount(amount_str):
     except (ValueError, TypeError):
         return None
 
-# --- MOTORE DI ESTRAZIONE PDF BASATO SU CROPPING DELLE COLONNE ---
-def extract_data_with_cropping(pdf_file):
+# --- NUOVO MOTORE DI ESTRAZIONE CHE RICONOSCE IL GRASSETTO ---
+def extract_data_with_formatting(pdf_file):
+    """
+    Estrae dati da un PDF analizzando la formattazione (grassetto) per
+    distinguere le macro-categorie (totali) dalle voci di dettaglio.
+    """
     all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
 
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
         is_ce_section = False
         for page in pdf.pages:
-            full_text = page.extract_text()
-            if "CONTO ECONOMICO" in full_text:
+            if "CONTO ECONOMICO" in page.extract_text():
                 is_ce_section = True
 
             mid_point = page.width / 2
+            # Bbox per colonna sinistra e destra
             left_bbox = (0, 0, mid_point, page.height)
             right_bbox = (mid_point, 0, page.width, page.height)
 
-            left_text = page.crop(left_bbox).extract_text(x_tolerance=2)
-            right_text = page.crop(right_bbox).extract_text(x_tolerance=2)
+            def process_column(column_bbox, target_list):
+                words = page.crop(column_bbox).extract_words(x_tolerance=2, y_tolerance=2)
+                if not words: return
 
-            def process_column(text, target_list):
-                pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$", re.MULTILINE)
-                if not text: return
-                
-                for line in text.split('\n'):
-                    line = line.strip()
-                    if len(line) < 5 or line.lower().startswith(('totale', 'attivita', 'passivita', 'costi', 'ricavi')):
-                        continue
+                lines = {}
+                for word in words:
+                    top = round(word['top'])
+                    if top not in lines:
+                        lines[top] = []
+                    lines[top].append(word)
+
+                for top in sorted(lines.keys()):
+                    line_words = sorted(lines[top], key=lambda w: w['x0'])
+                    line_text = " ".join(w['text'] for w in line_words)
                     
-                    cleaned_line = re.sub(r'^\d+\s*[-\s]*', '', line)
+                    # Rileva se la linea contiene testo in grassetto
+                    is_bold = any("Bold" in w['fontname'] for w in line_words)
                     
-                    match = pattern.search(cleaned_line)
+                    pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$")
+                    match = pattern.search(line_text)
+                    
                     if match:
-                        item_name = match.group(1).strip()
+                        item_name = re.sub(r'^\d+\s*[-\s]*', '', match.group(1).strip())
                         amount = clean_and_convert_amount(match.group(2))
-                        if amount is not None and len(item_name) > 3:
-                            target_list.append({'name': item_name, 'amount': amount})
+                        if amount is not None and len(item_name) > 3 and not item_name.lower().startswith('totale'):
+                            # Aggiunge solo le voci NON in grassetto
+                            if not is_bold:
+                                target_list.append({'name': item_name, 'amount': amount})
 
             if is_ce_section:
-                process_column(left_text, all_costs)
-                process_column(right_text, all_revenues)
+                process_column(left_bbox, all_costs)
+                process_column(right_bbox, all_revenues)
             else:
-                process_column(left_text, all_assets)
-                process_column(right_text, all_liabilities)
+                process_column(left_bbox, all_assets)
+                process_column(right_bbox, all_liabilities)
 
-    def filter_totals(entries):
-        indices_to_skip = set()
-        for i in range(len(entries)):
-            if i in indices_to_skip: continue
-            lookahead_sum = 0
-            sub_items_count = 0
-            for j in range(i + 1, min(i + 10, len(entries))):
-                lookahead_sum += entries[j]['amount']
-                sub_items_count += 1
-                if sub_items_count > 0 and math.isclose(entries[i]['amount'], lookahead_sum, rel_tol=0.015):
-                    indices_to_skip.add(i)
-                    break
-        return [entry for i, entry in enumerate(entries) if i not in indices_to_skip]
-
-    assets_details = filter_totals(all_assets)
-    liabilities_details = filter_totals(all_liabilities)
-    costs_details = filter_totals(all_costs)
-    revenues_details = filter_totals(all_revenues)
-    
-    income_details = costs_details + revenues_details
-
+    income_details = all_costs + all_revenues
     final_assets, final_liabilities, final_income = [], [], []
     
-    for entry in assets_details: final_assets.append(f"{entry['name']},{entry['amount']}")
-    for entry in liabilities_details: final_liabilities.append(f"{entry['name']},{entry['amount']}")
+    for entry in all_assets: final_assets.append(f"{entry['name']},{entry['amount']}")
+    for entry in all_liabilities: final_liabilities.append(f"{entry['name']},{entry['amount']}")
     for entry in income_details:
         item_name_lower = entry['name'].lower()
         ce_type = "Fisso"
         is_revenue = any(kw in item_name_lower for kw in KEYWORDS['income']['revenue'])
-        if is_revenue or entry in revenues_details:
+        if is_revenue or entry in all_revenues:
             ce_type = "Ricavo"
         elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']):
             ce_type = "Variabile"
@@ -145,64 +134,40 @@ def extract_data_with_cropping(pdf_file):
 
     return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
-# --- FUNZIONE PER PARSING CSV AGGIORNATA ---
+# --- FUNZIONE PER PARSING CSV ---
 def parse_csv_file(csv_file):
-    """
-    Legge un file CSV e popola le aree di testo, gestendo diverse codifiche ed errori di parsing.
-    """
     assets_data, liabilities_data, income_data = [], [], []
-    
     csv_content = csv_file.read()
     df = None
-    
-    configs = [
-        {'encoding': 'utf-8', 'sep': ','},
-        {'encoding': 'utf-8', 'sep': ';'},
-        {'encoding': 'latin-1', 'sep': ','},
-        {'encoding': 'latin-1', 'sep': ';'}
-    ]
-
+    configs = [{'encoding': 'utf-8', 'sep': ','}, {'encoding': 'utf-8', 'sep': ';'}, {'encoding': 'latin-1', 'sep': ','}, {'encoding': 'latin-1', 'sep': ';'}]
     for config in configs:
         try:
             df = pd.read_csv(io.BytesIO(csv_content), encoding=config['encoding'], sep=config['sep'], engine='python')
-            # Se la lettura ha successo e le colonne sembrano corrette, esce dal ciclo
             if 'voce' in [c.lower().strip() for c in df.columns]:
                 break
             else:
                 df = None
         except (UnicodeDecodeError, pd.errors.ParserError):
-            # Riposiziona il puntatore per la prossima lettura
             csv_file.seek(0)
             csv_content = csv_file.read()
             continue
-
     if df is None:
         st.error("Errore critico: Impossibile analizzare il file CSV.")
-        st.info("Consiglio: Assicurati che il file sia un CSV valido con separatore virgola (,) o punto e virgola (;). Prova a salvarlo da Excel scegliendo il formato 'CSV UTF-8 (delimitato da virgole)'.")
         return "", "", ""
-
     df.columns = [col.strip().lower() for col in df.columns]
-    
     required_cols = ['voce', 'importo', 'sezione']
     if not all(col in df.columns for col in required_cols):
-        st.error(f"Il file CSV deve contenere le colonne: {', '.join(required_cols)}")
+        found_cols = ', '.join(df.columns)
+        st.error(f"Errore nelle colonne del CSV. Richieste: {required_cols}. Trovate: {found_cols}")
         return "", "", ""
-        
     for _, row in df.iterrows():
-        voce = row['voce']
-        importo = row['importo']
-        sezione = row['sezione'].lower()
-        
-        if 'attivit' in sezione:
-            assets_data.append(f"{voce},{importo}")
-        elif 'passivit' in sezione or 'pn' in sezione:
-             liabilities_data.append(f"{voce},{importo}")
+        voce, importo, sezione = row['voce'], row['importo'], row['sezione'].lower()
+        if 'attivit' in sezione: assets_data.append(f"{voce},{importo}")
+        elif 'passivit' in sezione or 'pn' in sezione: liabilities_data.append(f"{voce},{importo}")
         elif 'conto economico' in sezione:
             tipo = row.get('tipo', 'Fisso')
             income_data.append(f"{voce},{importo},{tipo}")
-
     return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
-
 
 def parse_textarea_data(text):
     data = []
@@ -235,25 +200,25 @@ with st.sidebar:
         Il file CSV deve avere le seguenti colonne:
         - **voce**: La descrizione della voce di bilancio.
         - **importo**: L'importo numerico.
-        - **sezione**: Dove va classificata la voce. Valori: `Attività`, `Passività`, `PN`, `Conto Economico`.
-        - **tipo** (Opzionale): Solo per il CE. Valori: `Ricavo`, `Variabile`, `Fisso`.
+        - **sezione**: Valori: `Attività`, `Passività`, `PN`, `Conto Economico`.
+        - **tipo** (Opzionale, solo per CE): Valori: `Ricavo`, `Variabile`, `Fisso`.
         """)
 
     if uploaded_file:
         with st.spinner('Estrazione dati dal file...'):
             file_type = uploaded_file.name.split('.')[-1].lower()
             if file_type == 'pdf':
-                assets, liabilities, income = extract_data_with_cropping(uploaded_file)
+                assets, liabilities, income = extract_data_with_formatting(uploaded_file)
             elif file_type == 'csv':
                 assets, liabilities, income = parse_csv_file(uploaded_file)
             else:
                 assets, liabilities, income = "", "", ""
                 st.error("Formato file non supportato.")
-            
             st.session_state.assets_text = assets
             st.session_state.liabilities_text = liabilities
             st.session_state.income_text = income
-            st.success("Dati estratti! Controlla e avvia l'analisi.")
+            if assets or liabilities or income:
+                st.success("Dati estratti! Controlla e avvia l'analisi.")
 
     st.header("2. Dati Finanziari")
     st.markdown("Verifica i dati estratti o inseriscili manualmente.")

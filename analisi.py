@@ -47,7 +47,7 @@ KEYWORDS = {
     },
     'special_negative': ['f.do amm', 'fondo amm'], # Voci che sono rettificative dell'attivo
     'income': {
-         'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione', 'proventi', 'contributi in conto esercizio'],
+         'revenue': ['ricavi', 'vendite', 'fatturato', 'valore della produzione', 'proventi', 'contributi in conto esercizio', 'altri ricavi'],
          'variable': ['materie', 'consumo', 'acquisti', 'sussidiarie', 'lavorazioni', 'costi per materie'],
          'fixed': ['salari', 'stipendi', 'personale', 'costi del personale', 'ammortamenti', 'affitti', 'godimento beni terzi', 'interessi', 'oneri finanziari', 'servizi', 'sanzioni', 'multe', 'abbonamenti', 'imposte', 'oneri diversi', 'quote associative']
     }
@@ -73,20 +73,23 @@ def parse_financial_text(text):
     """
     all_entries = []
     
-    # Regex per trovare una descrizione seguita da un importo.
+    # Regex per trovare una descrizione (anche complessa) seguita da un importo.
     pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])")
     
-    clean_text = re.sub(r'SITUAZIONE.*?\n|Pag\..*?\n|Utente:.*?\n|Data:.*?\n|Partita IVA.*?\n|Codice Fiscale.*?\n', '', text, flags=re.IGNORECASE)
+    # Pulizia preliminare del testo da header e footer ricorrenti
+    clean_text = re.sub(r'SITUAZIONE.*?\n|Pag\..*?\n|Utente:.*?\n|Data:.*?\n|Partita IVA.*?\n|Codice Fiscale.*?\n|Esercizio.*?\n|Registrazioni.*?\n', '', text, flags=re.IGNORECASE)
 
     for line in clean_text.split('\n'):
+        # Rimuove codici conto (es. '123456 000-') per migliorare il matching
         cleaned_line = re.sub(r'^\d+\s*-\s*', '', line.strip())
         matches = pattern.findall(cleaned_line)
         
         for match in matches:
-            item_name = re.sub(r'\s{2,}', ' ', match[0].strip()) # Rimuove spazi extra
+            item_name = re.sub(r'\s{2,}', ' ', match[0].strip()) # Rimuove spazi multipli
             amount_str = match[1].strip()
 
             try:
+                # Gestisce sia il formato 1.234,56 che 1,234.56
                 if ',' in amount_str and '.' in amount_str:
                     amount = float(amount_str.replace('.', '').replace(',', '.'))
                 else:
@@ -94,36 +97,30 @@ def parse_financial_text(text):
             except ValueError:
                 continue
 
-            if len(item_name) < 4 or item_name.lower() in ['dal', 'al', 'costi', 'ricavi', 'attivita', 'passivita']:
+            # Ignora voci irrilevanti o troppo corte
+            if len(item_name) < 4 or item_name.lower() in ['dal', 'al', 'costi', 'ricavi', 'attivita', 'passivita', 'totale attivita', 'totale passivita']:
                 continue
             
-            # Aggiunge tutte le voci trovate a una lista temporanea
             all_entries.append({'name': item_name, 'amount': amount})
 
-    # --- Filtro Intelligente per Rimuovere i Totali ---
-    final_entries = []
-    i = 0
-    while i < len(all_entries):
+    # --- Filtro Intelligente per Rimuovere le Macro-Categorie (Totali) ---
+    indices_to_skip = set()
+    for i in range(len(all_entries)):
         current_entry = all_entries[i]
-        is_total = False
         
-        # Controlla se l'importo corrente è la somma dei successivi
+        # Cerca un blocco di voci successive la cui somma corrisponde alla voce corrente
         lookahead_sum = 0
-        # Aumentato il lookahead per gestire totali composti da più voci
-        for j in range(i + 1, min(i + 5, len(all_entries))):
+        for j in range(i + 1, min(i + 6, len(all_entries))):
             lookahead_sum += all_entries[j]['amount']
-            # Usa math.isclose per gestire piccole differenze di arrotondamento
-            if math.isclose(current_entry['amount'], lookahead_sum, rel_tol=1e-2):
-                is_total = True
+            # Usa math.isclose per tollerare piccole differenze di arrotondamento
+            if math.isclose(current_entry['amount'], lookahead_sum, rel_tol=0.01):
+                indices_to_skip.add(i) # Marca la voce corrente come totale da saltare
                 break
         
-        # Se non è un totale, lo aggiungiamo alla lista finale
-        if not is_total:
-            final_entries.append(current_entry)
+    # Crea la lista finale escludendo gli indici marcati
+    final_entries = [entry for i, entry in enumerate(all_entries) if i not in indices_to_skip]
         
-        i += 1
-        
-    # --- Classificazione delle Voci Filtrate ---
+    # --- Classificazione delle Voci di Dettaglio Filtrate ---
     assets_data, liabilities_data, income_data = [], [], []
     for entry in final_entries:
         item_name = entry['name']
@@ -144,7 +141,8 @@ def parse_financial_text(text):
             liabilities_data.append(entry_str)
             found = True
         
-        if not found or "totale a pareggio" in item_name_lower:
+        # Se non classificato o è una voce chiaramente di CE
+        if not found or "totale a pareggio" in item_name_lower or "utile d'esercizio" in item_name_lower:
             ce_type = "Fisso"
             if any(kw in item_name_lower for kw in KEYWORDS['income']['revenue']):
                 ce_type = "Ricavo"
@@ -243,7 +241,7 @@ if analyze_button:
         rimanenze = sum(d['amount'] for d in assets_data if 'rimanenze' in d['item'].lower() or 'scorte' in d['item'].lower())
         
         # Aggiunge l'utile dal CE al patrimonio netto per la quadratura
-        utile_from_pdf = sum(d['amount'] for d in income_data if 'utile' in d['item'].lower())
+        utile_from_pdf = sum(d['amount'] for d in income_data if "utile d'esercizio" in d['item'].lower())
         if utile_from_pdf > 0:
             bs['equity'] += utile_from_pdf
 

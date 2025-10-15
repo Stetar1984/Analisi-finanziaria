@@ -1,3 +1,5 @@
-streamlit
-pandas
-pdfplumber
+pandas>=2.0
+PyPDF2>=3.0
+pdfminer.six>=20240706
+streamlit>=1.37
+xlsxwriter>=3.2

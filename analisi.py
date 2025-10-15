@@ -52,90 +52,72 @@ KEYWORDS = {
 def clean_and_convert_amount(amount_str):
     if not amount_str: return None
     try:
-        cleaned_str = str(amount_str).strip()
-        if '.' in cleaned_str and ',' in cleaned_str:
-            if cleaned_str.rfind('.') > cleaned_str.rfind(','):
-                return float(cleaned_str.replace(',', ''))
-            else:
-                return float(cleaned_str.replace('.', '').replace(',', '.'))
-        return float(cleaned_str.replace(',', '.'))
+        cleaned_str = str(amount_str).strip().replace('.', '').replace(',', '.')
+        return float(cleaned_str)
     except (ValueError, TypeError):
         return None
 
-# --- MOTORE DI ESTRAZIONE CHE RICONOSCE IL GRASSETTO (CON CORREZIONE ERRORE) ---
-def extract_data_with_formatting(pdf_file):
+# --- NUOVO MOTORE DI ESTRAZIONE PER BILANCIO DI VERIFICA ---
+def extract_data_from_verification_balance(pdf_file):
     """
-    Estrae dati da un PDF analizzando la formattazione (grassetto) per
-    distinguere le macro-categorie (totali) dalle voci di dettaglio.
+    Estrae dati da un bilancio di verifica (formato DARE/AVERE/SALDO),
+    ignorando le voci in maiuscolo (macro-categorie).
     """
-    all_assets, all_liabilities, all_costs, all_revenues = [], [], [], []
-
+    assets_data, liabilities_data, income_data = [], [], []
+    
     with pdfplumber.open(io.BytesIO(pdf_file.read())) as pdf:
         is_ce_section = False
         for page in pdf.pages:
-            # Rileva se la pagina appartiene al Conto Economico
-            page_text_for_section_check = page.extract_text()
-            if page_text_for_section_check and "CONTO ECONOMICO" in page_text_for_section_check:
-                is_ce_section = True
-
-            mid_point = page.width / 2
-            # Bbox per colonna sinistra e destra
-            left_bbox = (0, 0, mid_point, page.height)
-            right_bbox = (mid_point, 0, page.width, page.height)
-
-            def process_column(column_bbox, target_list):
-                words = page.crop(column_bbox).extract_words(x_tolerance=2, y_tolerance=2)
-                if not words: return
-
-                lines = {}
-                for word in words:
-                    top = round(word['top'])
-                    if top not in lines:
-                        lines[top] = []
-                    lines[top].append(word)
-
-                for top in sorted(lines.keys()):
-                    line_words = sorted(lines[top], key=lambda w: w['x0'])
-                    line_text = " ".join(w['text'] for w in line_words)
+            tables = page.extract_tables()
+            for table in tables:
+                for row in table:
+                    # Una riga valida ha almeno 4 colonne: DESCRIZIONE, DARE, AVERE, SALDO
+                    if len(row) < 4: continue
                     
-                    # --- CORREZIONE ERRORE ---
-                    # Controlla in modo sicuro se 'fontname' esiste prima di accedervi.
-                    is_bold = any("Bold" in w.get('fontname', '') for w in line_words)
+                    desc, dare, avere, saldo_str = row[0], row[1], row[2], row[3]
                     
-                    pattern = re.compile(r"(.+?)\s+([\d.,]+[\d])\s*$")
-                    match = pattern.search(line_text)
+                    # Salta righe invalide o di intestazione
+                    if not desc or desc.strip() == "DESCRIZIONE": continue
                     
-                    if match:
-                        item_name = re.sub(r'^\d+\s*[-\s]*', '', match.group(1).strip())
-                        amount = clean_and_convert_amount(match.group(2))
-                        if amount is not None and len(item_name) > 3 and not item_name.lower().startswith('totale'):
-                            # Aggiunge solo le voci NON in grassetto
-                            if not is_bold:
-                                target_list.append({'name': item_name, 'amount': amount})
+                    # Pulisce la descrizione da codici e spazi extra
+                    desc = re.sub(r'^\d+\s*-\s*', '', desc.replace('\n', ' ')).strip()
+                    
+                    # --- REGOLA CHIAVE: IGNORA LE MACRO-CATEGORIE IN MAIUSCOLO ---
+                    if desc == desc.upper() and len(desc) > 1:
+                        continue
+                        
+                    # Estrae l'importo e il tipo di saldo (D/A)
+                    if saldo_str:
+                        saldo_parts = saldo_str.strip().split()
+                        if len(saldo_parts) == 2:
+                            amount = clean_and_convert_amount(saldo_parts[0])
+                            saldo_type = saldo_parts[1].upper()
+                            
+                            if amount is None: continue
+                            
+                            item_name_lower = desc.lower()
+                            entry_str = f"{desc},{amount}"
+                            
+                            if saldo_type == 'D': # DARE = Attività o Costo
+                                if any(kw in item_name_lower for kw in KEYWORDS['assets']['current'] + KEYWORDS['assets']['non_current']):
+                                    assets_data.append(entry_str)
+                                else:
+                                    # Assumiamo sia un costo per il CE
+                                    ce_type = "Fisso"
+                                    if any(kw in item_name_lower for kw in KEYWORDS['income']['variable']): ce_type = "Variabile"
+                                    income_data.append(f"{entry_str},{ce_type}")
+                                    
+                            elif saldo_type == 'A': # AVERE = Passività, PN o Ricavo
+                                if any(kw in item_name_lower for kw in KEYWORDS['special_negative']):
+                                    liabilities_data.append(f"{desc},{abs(amount)}")
+                                elif any(kw in item_name_lower for kw in KEYWORDS['liabilities']['current'] + KEYWORDS['liabilities']['non_current'] + KEYWORDS['liabilities']['equity']):
+                                    liabilities_data.append(entry_str)
+                                else:
+                                    # Assumiamo sia un ricavo per il CE
+                                    income_data.append(f"{entry_str},Ricavo")
 
-            if is_ce_section:
-                process_column(left_bbox, all_costs)
-                process_column(right_bbox, all_revenues)
-            else:
-                process_column(left_bbox, all_assets)
-                process_column(right_bbox, all_liabilities)
+    return "\n".join(assets_data), "\n".join(liabilities_data), "\n".join(income_data)
 
-    income_details = all_costs + all_revenues
-    final_assets, final_liabilities, final_income = [], [], []
-    
-    for entry in all_assets: final_assets.append(f"{entry['name']},{entry['amount']}")
-    for entry in all_liabilities: final_liabilities.append(f"{entry['name']},{entry['amount']}")
-    for entry in income_details:
-        item_name_lower = entry['name'].lower()
-        ce_type = "Fisso"
-        is_revenue = any(kw in item_name_lower for kw in KEYWORDS['income']['revenue'])
-        if is_revenue or entry in all_revenues:
-            ce_type = "Ricavo"
-        elif any(kw in item_name_lower for kw in KEYWORDS['income']['variable']):
-            ce_type = "Variabile"
-        final_income.append(f"{entry['name']},{entry['amount']},{ce_type}")
-
-    return "\n".join(final_assets), "\n".join(final_liabilities), "\n".join(final_income)
 
 # --- FUNZIONE PER PARSING CSV ---
 def parse_csv_file(csv_file):
@@ -188,7 +170,7 @@ def parse_textarea_data(text):
 
 # --- INTERFACCIA UTENTE (UI) ---
 st.title("📊 Analisi di Bilancio Automatizzata")
-st.markdown("Carica un bilancio in formato PDF o CSV, oppure inserisci i dati manualmente.")
+st.markdown("Carica un bilancio in formato **CSV (consigliato)** o PDF, oppure inserisci i dati manualmente.")
 
 if 'assets_text' not in st.session_state: st.session_state.assets_text = ""
 if 'liabilities_text' not in st.session_state: st.session_state.liabilities_text = ""
@@ -196,22 +178,22 @@ if 'income_text' not in st.session_state: st.session_state.income_text = ""
 
 with st.sidebar:
     st.header("1. Carica il Bilancio")
-    uploaded_file = st.file_uploader("Seleziona un file PDF o CSV", type=["pdf", "csv"])
+    uploaded_file = st.file_uploader("Seleziona un file CSV o PDF", type=["csv", "pdf"])
 
-    with st.expander("❓ Formato CSV richiesto"):
+    with st.expander("❓ **Formato CSV Richiesto (IMPORTANTE)**"):
         st.info("""
-        Il file CSV deve avere le seguenti colonne:
+        Per un'analisi precisa, usa un file CSV con queste colonne:
         - **voce**: La descrizione della voce di bilancio.
-        - **importo**: L'importo numerico.
-        - **sezione**: Valori: `Attività`, `Passività`, `PN`, `Conto Economico`.
-        - **tipo** (Opzionale, solo per CE): Valori: `Ricavo`, `Variabile`, `Fisso`.
+        - **importo**: L'importo numerico (es. `1234.56`).
+        - **sezione**: `Attività`, `Passività`, `PN`, `Conto Economico`.
+        - **tipo** (Opzionale, solo per CE): `Ricavo`, `Variabile`, `Fisso`.
         """)
 
     if uploaded_file:
         with st.spinner('Estrazione dati dal file...'):
             file_type = uploaded_file.name.split('.')[-1].lower()
             if file_type == 'pdf':
-                assets, liabilities, income = extract_data_with_formatting(uploaded_file)
+                assets, liabilities, income = extract_data_from_verification_balance(uploaded_file)
             elif file_type == 'csv':
                 assets, liabilities, income = parse_csv_file(uploaded_file)
             else:
@@ -225,10 +207,9 @@ with st.sidebar:
 
     st.header("2. Dati Finanziari")
     st.markdown("Verifica i dati estratti o inseriscili manualmente.")
-    
-    st.session_state.assets_text = st.text_area("ATTIVITÀ (Voce,Importo)", st.session_state.assets_text, height=150)
-    st.session_state.liabilities_text = st.text_area("PASSIVITÀ E PN (Voce,Importo)", st.session_state.liabilities_text, height=150)
-    st.session_state.income_text = st.text_area("CONTO ECONOMICO (Voce,Importo,Tipo*)", st.session_state.income_text, height=150, help="*Tipi: Ricavo, Variabile, Fisso")
+    st.text_area("ATTIVITÀ (Voce,Importo)", key="assets_text", height=150)
+    st.text_area("PASSIVITÀ E PN (Voce,Importo)", key="liabilities_text", height=150)
+    st.text_area("CONTO ECONOMICO (Voce,Importo,Tipo*)", key="income_text", height=150, help="*Tipi: Ricavo, Variabile, Fisso")
 
     st.header("3. Impostazioni")
     tax_rate = st.number_input("Aliquota Fiscale (%)", value=24.0, min_value=0.0, max_value=100.0, step=0.5) / 100
@@ -249,16 +230,11 @@ if analyze_button:
         # --- CALCOLO CON LOGICA CONTABILE CORRETTA ---
         total_raw_assets = sum(d['amount'] for d in assets_data)
         amortization_funds = sum(d['amount'] for d in liabilities_data if any(kw in d['item'].lower() for kw in KEYWORDS['special_negative']))
-        
         net_total_assets = total_raw_assets - amortization_funds
-        
         current_assets_raw = sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['current']))
         non_current_assets_raw = sum(d['amount'] for d in assets_data if any(kw in d['item'].lower() for kw in KEYWORDS['assets']['non_current']))
-        
         net_non_current_assets = non_current_assets_raw - amortization_funds
-
         liabilities_no_funds = [d for d in liabilities_data if not any(kw in d['item'].lower() for kw in KEYWORDS['special_negative'])]
-        
         bs = {
             'current_assets': current_assets_raw,
             'non_current_assets': net_non_current_assets,
@@ -266,28 +242,22 @@ if analyze_button:
             'non_current_liabilities': sum(d['amount'] for d in liabilities_no_funds if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['non_current'])),
             'equity': sum(d['amount'] for d in liabilities_no_funds if any(kw in d['item'].lower() for kw in KEYWORDS['liabilities']['equity'])),
         }
-        
         rimanenze = sum(d['amount'] for d in assets_data if 'rimanenze' in d['item'].lower() or 'scorte' in d['item'].lower())
-        
-        utile_from_pdf = sum(d['amount'] for d in income_data if "utile d'esercizio" in d['item'].lower())
+        utile_from_pdf = sum(d['amount'] for d in income_data if "utile d'esercizio" in d['item'].lower() or "utile" == d['item'].lower())
         if utile_from_pdf > 0:
             bs['equity'] += utile_from_pdf
-
         total_liabilities_and_equity = bs['current_liabilities'] + bs['non_current_liabilities'] + bs['equity']
-
         income = {
             'revenues': sum(d['amount'] for d in income_data if d['type'] == 'Ricavo'),
             'variable_costs': sum(d['amount'] for d in income_data if d['type'] == 'Variabile'),
-            'fixed_costs': sum(d['amount'] for d in income_data if d['type'] == 'Fisso' and "utile d'esercizio" not in d['item'].lower()),
+            'fixed_costs': sum(d['amount'] for d in income_data if d['type'] == 'Fisso' and "utile" not in d['item'].lower()),
         }
-
         contribution_margin = income['revenues'] - income['variable_costs']
         ebit = contribution_margin - income['fixed_costs']
         interest = sum(d['amount'] for d in income_data if 'interessi' in d['item'].lower() or 'oneri finanziari' in d['item'].lower())
         ebt = ebit - interest
         taxes = ebt * tax_rate if ebt > 0 else 0
         net_income = ebt - interest
-
         ratios = {
             'current_ratio': bs['current_assets'] / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
             'quick_ratio': (bs['current_assets'] - rimanenze) / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0,
@@ -298,18 +268,14 @@ if analyze_button:
             'contribution_margin_ratio': contribution_margin / income['revenues'] if income['revenues'] > 0 else 0,
             'break_even_point': income['fixed_costs'] / (contribution_margin / income['revenues']) if contribution_margin > 0 else 0
         }
-
         # --- VISUALIZZAZIONE ---
         st.header("Risultati dell'Analisi")
-        
         balance_diff = net_total_assets - total_liabilities_and_equity
-        if abs(balance_diff) < 20: # Tolleranza per arrotondamenti
+        if abs(balance_diff) < 20:
             st.success(f"✅ **Controllo:** Il bilancio quadra correttamente! (Differenza: {format_currency(balance_diff)})")
         else:
             st.warning(f"⚠️ **Attenzione:** Il bilancio non quadra! Differenza: {format_currency(balance_diff)}")
-
         tab1, tab2, tab3 = st.tabs(["📈 Dashboard Indici", "📑 Stato Patrimoniale", "💰 Conto Economico"])
-        
         with tab1:
             st.subheader("Dashboard Indici Principali")
             cols = st.columns(3)
@@ -324,7 +290,6 @@ if analyze_button:
             with cols[2]:
                 st.metric("Margine di Contribuzione %", format_percent(ratios['contribution_margin_ratio']))
                 st.metric("Punto di Pareggio (Fatturato)", format_currency(ratios['break_even_point']))
-        
         with tab2:
             st.subheader("Stato Patrimoniale Riclassificato (Criterio Finanziario)")
             col1, col2 = st.columns(2)
@@ -345,7 +310,6 @@ if analyze_button:
                     {"Voce": "**TOTALE PASSIVITÀ E PN**", "Importo": total_liabilities_and_equity}
                 ])
                 st.dataframe(sp_liab_df.style.format({"Importo": format_currency}), use_container_width=True)
-
         with tab3:
             st.subheader("Conto Economico Riclassificato (A Margine di Contribuzione)")
             ce_df = pd.DataFrame([

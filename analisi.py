@@ -246,7 +246,6 @@ if __name__ == "__main__":
     print(kpis.to_string(index=False))
 app_streamlit.py
 python
-Copia codice
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
